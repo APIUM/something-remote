@@ -1,0 +1,7 @@
+set(IDF_TARGET esp32)
+
+set(SDKCONFIG_DEFAULTS
+    ${CMAKE_CURRENT_LIST_DIR}/sdkconfig.board
+)
+
+set(MICROPY_FROZEN_MANIFEST ${CMAKE_CURRENT_LIST_DIR}/manifest.py)
