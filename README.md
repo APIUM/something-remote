@@ -17,38 +17,26 @@ BLE HID remote control for Nvidia Shield using M5Stack Atom Echo and MicroPython
 
 ## Prerequisites
 
-- Linux (tested on Ubuntu/WSL)
-- Python 3.8+
-- Git
+- Docker
 
-## Setup
+## Build (Docker)
 
-### 1. Install ESP-IDF v5.2.x
+### 1. Build Docker Image (first time only)
 
 ```bash
-cd ~
-git clone -b v5.2.2 --recursive https://github.com/espressif/esp-idf.git
-cd esp-idf
-./install.sh esp32
-source export.sh
+make docker-build
 ```
 
-### 2. Clone MicroPython
+### 2. Build Firmware
 
 ```bash
-cd ~
-git clone https://github.com/micropython/micropython.git
-cd micropython
-git checkout v1.24.1
-git submodule update --init
-make -C mpy-cross
+make build
 ```
 
-### 3. Build Firmware
+### 3. Copy Firmware to Local Directory
 
 ```bash
-cd /path/to/something-remote
-./build.sh
+make copy-firmware
 ```
 
 ### 4. Flash to Device
@@ -56,7 +44,22 @@ cd /path/to/something-remote
 Connect Atom Echo via USB, then:
 
 ```bash
-./flash.sh /dev/ttyUSB0
+make flash PORT=/dev/ttyUSB0
+```
+
+Or flash manually with esptool:
+
+```bash
+pip install esptool
+esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x1000 build/firmware.bin
+```
+
+### Interactive Shell
+
+To debug or explore the build environment:
+
+```bash
+make shell
 ```
 
 ## Usage

@@ -1,0 +1,21 @@
+services:
+  build:
+    build: .
+    image: shield-remote-build
+    volumes:
+      - .:/project
+    working_dir: /project
+    command: >
+      bash -c "
+        cd /opt/micropython/ports/esp32 &&
+        make BOARD_DIR=/project/board/ATOM_ECHO -j$(nproc)
+      "
+
+  shell:
+    build: .
+    image: shield-remote-build
+    volumes:
+      - .:/project
+    working_dir: /project
+    stdin_open: true
+    tty: true
