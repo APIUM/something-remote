@@ -3,6 +3,7 @@
 
 from machine import Pin
 import time
+import sys
 from neopixel import NeoPixel
 from hid_services import Keyboard
 
@@ -30,16 +31,19 @@ class ShieldRemote:
     """BLE HID remote control for Nvidia Shield."""
 
     def __init__(self, name="Shield Remote"):
+        # Initialize NeoPixel LED first for error display
+        self.led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
+        self.set_led(COLOR_OFF)
+
+        # Track if BLE is fully initialized
+        self._ble_ready = False
+
         # Initialize keyboard HID
         self.kb = Keyboard(name)
         self.kb.set_state_change_callback(self._on_state_change)
 
         # Initialize button (active LOW with external pullup)
         self.button = Pin(BUTTON_PIN, Pin.IN)
-
-        # Initialize NeoPixel LED
-        self.led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
-        self.set_led(COLOR_OFF)
 
         # State tracking
         self._connected = False
@@ -66,8 +70,9 @@ class ShieldRemote:
         elif state == Keyboard.DEVICE_IDLE:
             self._connected = False
             self.set_led(COLOR_BLUE)
-            # Auto-restart advertising
-            self.kb.start_advertising()
+            # Only auto-restart advertising if BLE is fully initialized
+            if self._ble_ready:
+                self.kb.start_advertising()
         else:
             self._connected = False
             self.set_led(COLOR_OFF)
@@ -122,7 +127,8 @@ class ShieldRemote:
         self.kb.start()
         time.sleep_ms(100)
 
-        # Start advertising
+        # Mark BLE as ready and start advertising
+        self._ble_ready = True
         self.kb.start_advertising()
         self.set_led(COLOR_BLUE)
         print("Ready - press button to send Right Arrow")
@@ -134,9 +140,22 @@ class ShieldRemote:
 
 
 def main():
-    """Entry point."""
-    remote = ShieldRemote()
-    remote.run()
+    """Entry point with error handling."""
+    led = None
+    try:
+        led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
+        remote = ShieldRemote()
+        remote.run()
+    except Exception as e:
+        # Show red LED on error
+        print("Error:", e)
+        sys.print_exception(e)
+        if led:
+            led[0] = COLOR_RED
+            led.write()
+        # Keep LED red and don't exit so error is visible
+        while True:
+            time.sleep_ms(1000)
 
 
 if __name__ == "__main__":
