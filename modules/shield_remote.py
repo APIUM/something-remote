@@ -1,49 +1,93 @@
 # Shield Remote - BLE HID Remote for Nvidia Shield
-# M5Stack Atom Echo implementation with 10-button support
+# Everything Remote hardware layout (21 buttons)
+# https://www.thestockpot.net/videos/theeverythingremote
 
-from machine import Pin, ADC
+from machine import Pin
 import time
 import sys
 from neopixel import NeoPixel
 from hid_services import Keyboard
 
-# Hardware pins for M5Stack Atom Echo
-BUTTON_PIN = 39      # Built-in button (Center/Select)
-POWER_PIN = 21       # External digital button (On/Off)
-ADC_PIN = 25         # Resistor ladder (8 buttons)
-LED_PIN = 27         # SK6812 NeoPixel
+# Everything Remote GPIO assignments
+PIN_POWER = 0         # Strapping pin - needs care
+PIN_BACK = 2          # Strapping pin - needs care
+PIN_HOME = 4
+PIN_PLAY_PAUSE = 5
+PIN_UP = 18
+PIN_LEFT = 19
+PIN_SELECT = 22
+PIN_RIGHT = 23
+PIN_DOWN = 25
+PIN_VOL_UP = 12
+PIN_MUTE = 13
+PIN_CH_UP = 14
+PIN_VOL_DOWN = 15
+PIN_SETTINGS = 16
+PIN_CH_DOWN = 17
+PIN_SHORTCUT_3 = 32
+PIN_SHORTCUT_4 = 33
+PIN_BRIGHT_DOWN = 26
+PIN_BRIGHT_UP = 27
+PIN_SHORTCUT_1 = 34   # Input-only, no internal pull-up
+PIN_SHORTCUT_2 = 35   # Input-only, no internal pull-up
 
-# HID key codes (USB HID Usage Tables)
+# Status LED (directly on GPIO, optional external NeoPixel)
+LED_PIN = 21          # Or use onboard LED if available
+
+# HID key codes (USB HID Keyboard Usage Tables)
 KEY_UP = 0x52
 KEY_DOWN = 0x51
 KEY_LEFT = 0x50
 KEY_RIGHT = 0x4F
-KEY_ENTER = 0x28      # Center/Select
+KEY_ENTER = 0x28      # Select
 KEY_ESCAPE = 0x29     # Back
-KEY_HOME = 0x4A       # Home (Keyboard Home key)
-KEY_POWER = 0x66      # Power (Keyboard Power key)
-KEY_VOL_UP = 0x80     # Volume Up
-KEY_VOL_DOWN = 0x81   # Volume Down
+KEY_HOME = 0x4A       # Home
+KEY_POWER = 0x66      # Power
+KEY_SPACE = 0x2C      # Play/Pause (space often works)
+KEY_PAGE_UP = 0x4B    # Channel Up
+KEY_PAGE_DOWN = 0x4E  # Channel Down
+KEY_F1 = 0x3A         # Shortcut 1
+KEY_F2 = 0x3B         # Shortcut 2
+KEY_F3 = 0x3C         # Shortcut 3
+KEY_F4 = 0x3D         # Shortcut 4
+KEY_F5 = 0x3E         # Settings
+KEY_F6 = 0x3F         # Mute (mapped to F6, needs Consumer HID for real mute)
+KEY_F7 = 0x40         # Brightness Down
+KEY_F8 = 0x41         # Brightness Up
+KEY_VOL_UP = 0x80     # Volume Up (may need Consumer HID)
+KEY_VOL_DOWN = 0x81   # Volume Down (may need Consumer HID)
 
-# LED colors (GRB format for SK6812)
+# LED colors (accent LED if present)
 COLOR_OFF = (0, 0, 0)
 COLOR_BLUE = (0, 0, 32)       # Advertising
-COLOR_GREEN = (32, 0, 0)      # Connected
+COLOR_GREEN = (32, 0, 0)      # Connected (GRB)
 COLOR_WHITE = (32, 32, 32)    # Button pressed
-COLOR_RED = (0, 32, 0)        # Error
+COLOR_RED = (0, 32, 0)        # Error (GRB)
 
-# ADC thresholds for resistor ladder (8 buttons on G25)
-# Values need calibration based on actual resistors used
-# Format: (min_value, max_value, key_code, name)
-ADC_BUTTONS = [
-    (3300, 3700, KEY_UP, "Up"),
-    (2800, 3200, KEY_DOWN, "Down"),
-    (2300, 2700, KEY_LEFT, "Left"),
-    (1800, 2200, KEY_RIGHT, "Right"),
-    (1300, 1700, KEY_ESCAPE, "Back"),
-    (800, 1200, KEY_HOME, "Home"),
-    (400, 700, KEY_VOL_UP, "Vol+"),
-    (100, 350, KEY_VOL_DOWN, "Vol-"),
+# Button definitions: (pin, key_code, name, has_pullup)
+# GPIO 34/35 are input-only with no internal pull-up
+BUTTONS = [
+    (PIN_UP, KEY_UP, "Up", True),
+    (PIN_DOWN, KEY_DOWN, "Down", True),
+    (PIN_LEFT, KEY_LEFT, "Left", True),
+    (PIN_RIGHT, KEY_RIGHT, "Right", True),
+    (PIN_SELECT, KEY_ENTER, "Select", True),
+    (PIN_BACK, KEY_ESCAPE, "Back", True),
+    (PIN_HOME, KEY_HOME, "Home", True),
+    (PIN_POWER, KEY_POWER, "Power", True),
+    (PIN_PLAY_PAUSE, KEY_SPACE, "Play/Pause", True),
+    (PIN_VOL_UP, KEY_VOL_UP, "Vol+", True),
+    (PIN_VOL_DOWN, KEY_VOL_DOWN, "Vol-", True),
+    (PIN_MUTE, KEY_F6, "Mute", True),
+    (PIN_CH_UP, KEY_PAGE_UP, "Ch+", True),
+    (PIN_CH_DOWN, KEY_PAGE_DOWN, "Ch-", True),
+    (PIN_SETTINGS, KEY_F5, "Settings", True),
+    (PIN_BRIGHT_UP, KEY_F8, "Bright+", True),
+    (PIN_BRIGHT_DOWN, KEY_F7, "Bright-", True),
+    (PIN_SHORTCUT_1, KEY_F1, "Shortcut1", False),  # No internal pull-up
+    (PIN_SHORTCUT_2, KEY_F2, "Shortcut2", False),  # No internal pull-up
+    (PIN_SHORTCUT_3, KEY_F3, "Shortcut3", True),
+    (PIN_SHORTCUT_4, KEY_F4, "Shortcut4", True),
 ]
 
 
@@ -51,9 +95,13 @@ class ShieldRemote:
     """BLE HID remote control for Nvidia Shield."""
 
     def __init__(self, name="Shield Remote"):
-        # Initialize NeoPixel LED first for error display
-        self.led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
-        self.set_led(COLOR_OFF)
+        # Try to initialize LED (may not be present)
+        self.led = None
+        try:
+            self.led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
+            self.set_led(COLOR_OFF)
+        except Exception:
+            print("No NeoPixel LED on GPIO", LED_PIN)
 
         # Track if BLE is fully initialized
         self._ble_ready = False
@@ -63,26 +111,28 @@ class ShieldRemote:
         self.kb.set_state_change_callback(self._on_state_change)
 
         # Initialize buttons
-        self.btn_center = Pin(BUTTON_PIN, Pin.IN)  # Built-in, active LOW
-        self.btn_power = Pin(POWER_PIN, Pin.IN, Pin.PULL_UP)  # External, active LOW
-
-        # Initialize ADC for resistor ladder
-        self.adc = ADC(Pin(ADC_PIN))
-        self.adc.atten(ADC.ATTN_11DB)  # Full range 0-3.3V
-        self.adc.width(ADC.WIDTH_12BIT)  # 12-bit resolution (0-4095)
+        self.buttons = []
+        self.button_states = []
+        for pin_num, key_code, name, has_pullup in BUTTONS:
+            if has_pullup:
+                btn = Pin(pin_num, Pin.IN, Pin.PULL_UP)
+            else:
+                # GPIO 34/35 need external pull-up resistor
+                btn = Pin(pin_num, Pin.IN)
+            self.buttons.append((btn, key_code, name))
+            self.button_states.append(1)  # Initial state (not pressed)
 
         # State tracking
         self._connected = False
-        self._last_center_state = 1
-        self._last_power_state = 1
-        self._last_adc_key = None
         self._last_press_time = 0
         self._debounce_ms = 50
+        self._any_pressed = False
 
     def set_led(self, color):
         """Set LED color (GRB tuple)."""
-        self.led[0] = color
-        self.led.write()
+        if self.led:
+            self.led[0] = color
+            self.led.write()
 
     def _on_state_change(self):
         """Handle BLE state changes."""
@@ -98,7 +148,6 @@ class ShieldRemote:
         elif state == Keyboard.DEVICE_IDLE:
             self._connected = False
             self.set_led(COLOR_BLUE)
-            # Only auto-restart advertising if BLE is fully initialized
             if self._ble_ready:
                 self.kb.start_advertising()
         else:
@@ -121,85 +170,60 @@ class ShieldRemote:
             self.kb.set_keys()
             self.kb.notify_hid_report()
 
-    def _read_adc_button(self):
-        """Read resistor ladder and return key code or None."""
-        value = self.adc.read()
-
-        for min_val, max_val, key_code, name in ADC_BUTTONS:
-            if min_val <= value <= max_val:
-                return key_code, name
-
-        return None, None
-
     def _handle_buttons(self):
         """Handle all button inputs."""
         now = time.ticks_ms()
-        pressed = False
 
         # Debounce check
         if time.ticks_diff(now, self._last_press_time) < self._debounce_ms:
             return
 
-        # Check center button (G39, built-in)
-        center_state = self.btn_center.value()
-        if center_state != self._last_center_state:
-            self._last_press_time = now
-            self._last_center_state = center_state
-            if center_state == 0:  # Pressed
-                self.set_led(COLOR_WHITE)
-                self._send_key(KEY_ENTER, "Center")
-                pressed = True
-            else:  # Released
-                self._release_keys()
-
-        # Check power button (G21, external)
-        power_state = self.btn_power.value()
-        if power_state != self._last_power_state:
-            self._last_press_time = now
-            self._last_power_state = power_state
-            if power_state == 0:  # Pressed
-                self.set_led(COLOR_WHITE)
-                self._send_key(KEY_POWER, "Power")
-                pressed = True
-            else:  # Released
-                self._release_keys()
-
-        # Check ADC resistor ladder (G25)
-        adc_key, adc_name = self._read_adc_button()
-        if adc_key != self._last_adc_key:
-            self._last_press_time = now
-            if adc_key is not None:  # Button pressed
-                self.set_led(COLOR_WHITE)
-                self._send_key(adc_key, adc_name)
-                pressed = True
-            else:  # Button released
-                if self._last_adc_key is not None:
+        # Check each button
+        for i, (btn, key_code, name) in enumerate(self.buttons):
+            state = btn.value()
+            if state != self.button_states[i]:
+                self._last_press_time = now
+                self.button_states[i] = state
+                if state == 0:  # Pressed (active LOW)
+                    self.set_led(COLOR_WHITE)
+                    self._send_key(key_code, name)
+                    self._any_pressed = True
+                else:  # Released
                     self._release_keys()
-            self._last_adc_key = adc_key
 
-        # Reset LED if not pressed
-        if not pressed and center_state == 1 and power_state == 1 and adc_key is None:
+        # Check if any button is currently pressed
+        any_currently_pressed = any(btn.value() == 0 for btn, _, _ in self.buttons)
+
+        # Reset LED if no buttons pressed
+        if not any_currently_pressed and self._any_pressed:
+            self._any_pressed = False
             if self._connected:
                 self.set_led(COLOR_GREEN)
             else:
                 self.set_led(COLOR_BLUE)
 
-    def calibrate_adc(self):
-        """Helper to calibrate ADC values. Run interactively."""
-        print("ADC Calibration Mode")
-        print("Press each button and note the ADC value")
-        print("Press Ctrl+C to exit")
+    def test_buttons(self):
+        """Interactive button test mode."""
+        print("Button Test Mode - Everything Remote")
+        print("Press each button to test. Ctrl+C to exit.")
+        print(f"Testing {len(self.buttons)} buttons")
         try:
             while True:
-                value = self.adc.read()
-                print(f"ADC: {value}", end="\r")
-                time.sleep_ms(100)
+                for i, (btn, key_code, name) in enumerate(self.buttons):
+                    if btn.value() == 0:
+                        print(f"{name} (GPIO{BUTTONS[i][0]}, 0x{key_code:02X})")
+                        self.set_led(COLOR_WHITE)
+                        while btn.value() == 0:
+                            time.sleep_ms(10)
+                        self.set_led(COLOR_OFF)
+                time.sleep_ms(10)
         except KeyboardInterrupt:
-            print("\nCalibration ended")
+            print("\nTest ended")
 
     def run(self):
         """Main loop - start BLE and handle button input."""
         print("Starting Shield Remote...")
+        print("Everything Remote hardware - 21 buttons")
         self.set_led(COLOR_RED)  # Initializing
 
         # Start BLE services
@@ -210,8 +234,7 @@ class ShieldRemote:
         self._ble_ready = True
         self.kb.start_advertising()
         self.set_led(COLOR_BLUE)
-        print("Ready - 10 button remote")
-        print("Buttons: Center(G39), Power(G21), D-pad+Nav(G25 ladder)")
+        print("Ready - BLE advertising as 'Shield Remote'")
 
         # Main loop
         while True:
@@ -223,25 +246,26 @@ def main():
     """Entry point with error handling."""
     led = None
     try:
-        led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
+        try:
+            led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
+        except Exception:
+            pass
         remote = ShieldRemote()
         remote.run()
     except Exception as e:
-        # Show red LED on error
         print("Error:", e)
         sys.print_exception(e)
         if led:
             led[0] = COLOR_RED
             led.write()
-        # Keep LED red and don't exit so error is visible
         while True:
             time.sleep_ms(1000)
 
 
-def calibrate():
-    """Run ADC calibration helper."""
+def test():
+    """Run button test mode."""
     remote = ShieldRemote()
-    remote.calibrate_adc()
+    remote.test_buttons()
 
 
 if __name__ == "__main__":
