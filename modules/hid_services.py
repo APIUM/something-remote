@@ -330,7 +330,7 @@ class HumanInterfaceDevice:
 
 
 class Keyboard(HumanInterfaceDevice):
-    """BLE HID Keyboard implementation."""
+    """BLE HID Keyboard with Consumer Control support."""
 
     def __init__(self, name="BLE Keyboard"):
         super().__init__(name)
@@ -342,18 +342,22 @@ class Keyboard(HumanInterfaceDevice):
                 (UUID(0x2A4A), F_READ),  # HID Information
                 (UUID(0x2A4B), F_READ),  # Report Map
                 (UUID(0x2A4C), F_READ_WRITE_NORESPONSE),  # Control Point
-                (UUID(0x2A4D), F_READ_NOTIFY, (  # Input Report
+                (UUID(0x2A4D), F_READ_NOTIFY, (  # Input Report (Keyboard)
                     (UUID(0x2908), DSC_F_READ),  # Report Reference
                 )),
                 (UUID(0x2A4D), F_READ_WRITE_NOTIFY_NORESPONSE, (  # Output Report
                     (UUID(0x2908), DSC_F_READ),
                 )),
+                (UUID(0x2A4D), F_READ_NOTIFY, (  # Input Report (Consumer)
+                    (UUID(0x2908), DSC_F_READ),  # Report Reference
+                )),
                 (UUID(0x2A4E), F_READ_WRITE_NORESPONSE),  # Protocol Mode
             ),
         )
 
-        # HID Report Descriptor for keyboard
+        # HID Report Descriptor for keyboard + consumer control
         self.HID_INPUT_REPORT = bytes([
+            # Keyboard Report (ID 1)
             0x05, 0x01,  # Usage Page (Generic Desktop)
             0x09, 0x06,  # Usage (Keyboard)
             0xA1, 0x01,  # Collection (Application)
@@ -387,12 +391,29 @@ class Keyboard(HumanInterfaceDevice):
             0x29, 0x65,  #   Usage Maximum (101)
             0x81, 0x00,  #   Input (Data, Array) - Key array
             0xC0,        # End Collection
+
+            # Consumer Control Report (ID 2)
+            0x05, 0x0C,  # Usage Page (Consumer)
+            0x09, 0x01,  # Usage (Consumer Control)
+            0xA1, 0x01,  # Collection (Application)
+            0x85, 0x02,  #   Report ID (2)
+            0x15, 0x00,  #   Logical Minimum (0)
+            0x26, 0xFF, 0x03,  # Logical Maximum (1023)
+            0x19, 0x00,  #   Usage Minimum (0)
+            0x2A, 0xFF, 0x03,  # Usage Maximum (1023)
+            0x75, 0x10,  #   Report Size (16)
+            0x95, 0x01,  #   Report Count (1)
+            0x81, 0x00,  #   Input (Data, Array)
+            0xC0,        # End Collection
         ])
 
         # Keyboard state
         self.modifiers = 0
         self.keypresses = [0x00] * 6
         self.kb_callback = None
+
+        # Consumer control state
+        self.consumer_code = 0
 
         self.services.append(self.HIDS)
 
@@ -418,20 +439,26 @@ class Keyboard(HumanInterfaceDevice):
     def save_service_characteristics(self, handles):
         super().save_service_characteristics(handles)
 
-        h_info, h_hid, h_ctrl, self.h_rep, h_d1, self.h_repout, h_d2, h_proto = handles[2]
+        # Unpack handles for HID service
+        # Order: info, report_map, ctrl, kb_input, kb_ref, kb_output, kb_out_ref, consumer_input, consumer_ref, proto
+        h_info, h_hid, h_ctrl, self.h_rep, h_d1, self.h_repout, h_d2, self.h_rep_consumer, h_d3, h_proto = handles[2]
 
         state = struct.pack("8B", self.modifiers, 0,
                            self.keypresses[0], self.keypresses[1],
                            self.keypresses[2], self.keypresses[3],
                            self.keypresses[4], self.keypresses[5])
 
+        consumer_state = struct.pack("<H", self.consumer_code)
+
         self.characteristics[h_info] = ("HID Info", b"\x01\x01\x00\x00")
         self.characteristics[h_hid] = ("Report Map", self.HID_INPUT_REPORT)
         self.characteristics[h_ctrl] = ("Control", b"\x00")
-        self.characteristics[self.h_rep] = ("Input Report", state)
-        self.characteristics[h_d1] = ("Input Ref", struct.pack("<BB", 1, 1))
-        self.characteristics[self.h_repout] = ("Output Report", state)
-        self.characteristics[h_d2] = ("Output Ref", struct.pack("<BB", 1, 2))
+        self.characteristics[self.h_rep] = ("KB Input", state)
+        self.characteristics[h_d1] = ("KB Input Ref", struct.pack("<BB", 1, 1))  # Report ID 1, Input
+        self.characteristics[self.h_repout] = ("KB Output", state)
+        self.characteristics[h_d2] = ("KB Output Ref", struct.pack("<BB", 1, 2))  # Report ID 1, Output
+        self.characteristics[self.h_rep_consumer] = ("Consumer Input", consumer_state)
+        self.characteristics[h_d3] = ("Consumer Ref", struct.pack("<BB", 2, 1))  # Report ID 2, Input
         self.characteristics[h_proto] = ("Protocol", b"\x01")
 
     def notify_hid_report(self):
@@ -440,8 +467,15 @@ class Keyboard(HumanInterfaceDevice):
                                self.keypresses[0], self.keypresses[1],
                                self.keypresses[2], self.keypresses[3],
                                self.keypresses[4], self.keypresses[5])
-            self.characteristics[self.h_rep] = ("Input Report", state)
+            self.characteristics[self.h_rep] = ("KB Input", state)
             self._ble.gatts_notify(self.conn_handle, self.h_rep, state)
+
+    def notify_consumer_report(self):
+        """Send consumer control report (media keys)."""
+        if self.is_connected():
+            state = struct.pack("<H", self.consumer_code)
+            self.characteristics[self.h_rep_consumer] = ("Consumer Input", state)
+            self._ble.gatts_notify(self.conn_handle, self.h_rep_consumer, state)
 
     def set_modifiers(self, right_gui=0, right_alt=0, right_shift=0, right_control=0,
                       left_gui=0, left_alt=0, left_shift=0, left_control=0):
@@ -451,6 +485,23 @@ class Keyboard(HumanInterfaceDevice):
 
     def set_keys(self, k0=0x00, k1=0x00, k2=0x00, k3=0x00, k4=0x00, k5=0x00):
         self.keypresses = [k0, k1, k2, k3, k4, k5]
+
+    def set_consumer(self, code=0x00):
+        """Set consumer control code. Common codes:
+        0x00 = Release
+        0x30 = Power
+        0x40 = Menu
+        0xB5 = Next Track
+        0xB6 = Prev Track
+        0xB7 = Stop
+        0xCD = Play/Pause
+        0xE2 = Mute
+        0xE9 = Volume Up
+        0xEA = Volume Down
+        0x223 = AC Home
+        0x224 = AC Back
+        """
+        self.consumer_code = code
 
     def set_kb_callback(self, callback):
         self.kb_callback = callback
