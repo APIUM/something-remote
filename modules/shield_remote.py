@@ -2,7 +2,8 @@
 # Everything Remote hardware layout (21 buttons)
 # https://www.thestockpot.net/videos/theeverythingremote
 
-from machine import Pin
+from machine import Pin, ADC, lightsleep, deepsleep
+import esp32
 import time
 import sys
 from neopixel import NeoPixel
@@ -29,10 +30,34 @@ PIN_SHORTCUT_4 = 33
 PIN_BRIGHT_DOWN = 26
 PIN_BRIGHT_UP = 27
 PIN_SHORTCUT_1 = 34   # Input-only, no internal pull-up
-PIN_SHORTCUT_2 = 35   # Input-only, no internal pull-up
+# PIN_SHORTCUT_2 = 35 # Now used for battery monitoring (LOLIN voltage divider)
+PIN_BATTERY = 35      # LOLIN battery monitor (100k/100k divider)
 
 # Status LED (directly on GPIO, optional external NeoPixel)
 LED_PIN = 21          # Or use onboard LED if available
+
+# RTC GPIO pins that can wake from deep sleep
+# These are the button pins that are also RTC-capable
+WAKE_PINS = [
+    PIN_POWER,      # GPIO0
+    PIN_BACK,       # GPIO2
+    PIN_HOME,       # GPIO4
+    PIN_VOL_UP,     # GPIO12
+    PIN_MUTE,       # GPIO13
+    PIN_CH_UP,      # GPIO14
+    PIN_VOL_DOWN,   # GPIO15
+    PIN_DOWN,       # GPIO25
+    PIN_BRIGHT_DOWN,# GPIO26
+    PIN_BRIGHT_UP,  # GPIO27
+    PIN_SHORTCUT_3, # GPIO32
+    PIN_SHORTCUT_4, # GPIO33
+    PIN_SHORTCUT_1, # GPIO34
+]
+
+# Power management settings
+IDLE_TIMEOUT_CONNECTED_MS = 30 * 60 * 1000  # 30 minutes when connected
+IDLE_TIMEOUT_DISCONNECTED_MS = 2 * 60 * 1000  # 2 minutes when not connected
+LIGHT_SLEEP_MS = 50               # Light sleep interval between polls
 
 # HID key codes (USB HID Keyboard Usage Tables - Page 0x07)
 KEY_UP = 0x52
@@ -102,7 +127,7 @@ BUTTONS = [
     (PIN_BRIGHT_UP, KEY_F8, "Bright+", True, TYPE_KEY),
     (PIN_BRIGHT_DOWN, KEY_F7, "Bright-", True, TYPE_KEY),
     (PIN_SHORTCUT_1, KEY_F1, "Shortcut1", False, TYPE_KEY),  # No internal pull-up
-    (PIN_SHORTCUT_2, KEY_F2, "Shortcut2", False, TYPE_KEY),  # No internal pull-up
+    # Shortcut2 (GPIO35) removed - used for battery monitoring
     (PIN_SHORTCUT_3, KEY_F3, "Shortcut3", True, TYPE_KEY),
     (PIN_SHORTCUT_4, KEY_F4, "Shortcut4", True, TYPE_KEY),
 ]
@@ -146,11 +171,101 @@ class ShieldRemote:
         self._any_pressed = False
         self._active_type = None  # Track which report type is active
 
+        # Battery monitoring (LOLIN boards have 100k/100k divider on GPIO35)
+        self._battery_adc = ADC(Pin(PIN_BATTERY))
+        self._battery_adc.atten(ADC.ATTN_11DB)  # Full range 0-3.3V
+        self._last_battery_update = 0
+        self._battery_update_interval = 60000  # Update every 60 seconds
+
+        # Power management
+        self._last_activity = time.ticks_ms()
+        self._setup_wake_pins()
+
+        # Advertising check
+        self._last_adv_check = 0
+        self._adv_check_interval = 10000  # Check every 10 seconds
+
+    def _setup_wake_pins(self):
+        """Configure RTC GPIO pins for deep sleep wake."""
+        self._wake_pin_objects = []
+        for pin_num in WAKE_PINS:
+            pin = Pin(pin_num, Pin.IN, Pin.PULL_UP)
+            self._wake_pin_objects.append(pin)
+
+    def _enter_deep_sleep(self):
+        """Enter deep sleep mode, wake on any RTC button."""
+        print("Entering deep sleep...")
+        self.set_led(COLOR_OFF)
+
+        # Configure wake on any button press (LOW level)
+        # esp32.WAKEUP_ALL_LOW (0) = wake when ANY pin goes LOW (for active-low buttons)
+        esp32.wake_on_ext1(self._wake_pin_objects, esp32.WAKEUP_ALL_LOW)
+
+        deepsleep()
+
+    def _check_idle_timeout(self):
+        """Check if we should enter deep sleep due to inactivity."""
+        now = time.ticks_ms()
+        idle_time = time.ticks_diff(now, self._last_activity)
+
+        # Use shorter timeout when not connected
+        if self._connected:
+            timeout = IDLE_TIMEOUT_CONNECTED_MS
+        else:
+            timeout = IDLE_TIMEOUT_DISCONNECTED_MS
+
+        if idle_time >= timeout:
+            self._enter_deep_sleep()
+
+    def _reset_activity(self):
+        """Reset the idle timer on activity."""
+        self._last_activity = time.ticks_ms()
+
+    def _ensure_advertising(self):
+        """Make sure we're advertising if not connected."""
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self._last_adv_check) >= self._adv_check_interval:
+            self._last_adv_check = now
+            if not self._connected and self._ble_ready:
+                # Restart advertising if it stopped
+                if not self.kb.is_advertising():
+                    print("Restarting advertising...")
+                    self.kb.start_advertising()
+                    self.set_led(COLOR_BLUE)
+
     def set_led(self, color):
         """Set LED color (GRB tuple)."""
         if self.led:
             self.led[0] = color
             self.led.write()
+
+    def _read_battery(self):
+        """Read battery voltage and return percentage (0-100)."""
+        raw = self._battery_adc.read()
+        # LOLIN has 100k/100k divider, so multiply by 2
+        voltage = (raw / 4095) * 3.3 * 2
+
+        # LiPo voltage to percentage (approximate)
+        # 4.2V = 100%, 3.2V = 0%
+        if voltage >= 4.2:
+            percent = 100
+        elif voltage <= 3.2:
+            percent = 0
+        else:
+            percent = int((voltage - 3.2) / 1.0 * 100)
+
+        return percent, voltage
+
+    def _update_battery(self):
+        """Update battery level if interval has passed."""
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self._last_battery_update) >= self._battery_update_interval:
+            self._last_battery_update = now
+            percent, voltage = self._read_battery()
+            self.kb.set_battery_level(percent)
+            if self._connected:
+                self.kb.notify_battery_level()
+            print(f"Battery: {percent}% ({voltage:.2f}V)")
 
     def _on_state_change(self):
         """Handle BLE state changes."""
@@ -216,6 +331,7 @@ class ShieldRemote:
                     self.set_led(COLOR_WHITE)
                     self._send_key(code, name, btn_type)
                     self._any_pressed = True
+                    self._reset_activity()  # Reset idle timer on button press
                 else:  # Released
                     self._release_keys()
 
@@ -252,8 +368,9 @@ class ShieldRemote:
     def run(self):
         """Main loop - start BLE and handle button input."""
         print("Starting Shield Remote...")
-        print("Everything Remote hardware - 21 buttons")
+        print("Everything Remote hardware - 20 buttons")
         print("Keyboard + Consumer Control HID")
+        print(f"Power: light sleep {LIGHT_SLEEP_MS}ms, deep sleep after {IDLE_TIMEOUT_DISCONNECTED_MS // 60000}m (NC) / {IDLE_TIMEOUT_CONNECTED_MS // 60000}m (C)")
         self.set_led(COLOR_RED)  # Initializing
 
         # Start BLE services
@@ -266,10 +383,21 @@ class ShieldRemote:
         self.set_led(COLOR_BLUE)
         print("Ready - BLE advertising as 'Shield Remote'")
 
-        # Main loop
+        # Initial battery reading
+        percent, voltage = self._read_battery()
+        self.kb.set_battery_level(percent)
+        print(f"Battery: {percent}% ({voltage:.2f}V)")
+
+        # Main loop with power management
         while True:
             self._handle_buttons()
-            time.sleep_ms(10)  # 10ms poll interval
+            self._update_battery()
+            self._ensure_advertising()
+            self._check_idle_timeout()
+
+            # Light sleep between polls to save power
+            # BLE stays active during light sleep
+            lightsleep(LIGHT_SLEEP_MS)
 
 
 def main():

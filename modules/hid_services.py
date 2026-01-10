@@ -92,7 +92,8 @@ class Advertiser:
 
     def start_advertising(self):
         if not self.advertising:
-            self._ble.gap_advertise(100000, adv_data=self._payload)
+            # Advertise indefinitely (0 = no timeout) with 100ms interval
+            self._ble.gap_advertise(100000, adv_data=self._payload, connectable=True)
             self.advertising = True
 
     def stop_advertising(self):
