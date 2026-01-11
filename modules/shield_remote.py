@@ -185,6 +185,10 @@ class ShieldRemote:
         self._last_adv_check = 0
         self._adv_check_interval = 10000  # Check every 10 seconds
 
+        # BLE forget combo (Power + Back held for 5 seconds)
+        self._forget_combo_start = 0
+        self._forget_combo_duration = 5000  # 5 seconds
+
     def _setup_wake_pins(self):
         """Configure RTC GPIO pins for deep sleep wake."""
         self._wake_pin_objects = []
@@ -232,6 +236,48 @@ class ShieldRemote:
                     print("Restarting advertising...")
                     self.kb.start_advertising()
                     self.set_led(COLOR_BLUE)
+
+    def _check_forget_combo(self):
+        """Check if Power + Back held for 5 seconds to forget BLE bonds."""
+        # Get Power (GPIO0) and Back (GPIO2) button states
+        power_pressed = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP).value() == 0
+        back_pressed = Pin(PIN_BACK, Pin.IN, Pin.PULL_UP).value() == 0
+
+        now = time.ticks_ms()
+
+        if power_pressed and back_pressed:
+            if self._forget_combo_start == 0:
+                self._forget_combo_start = now
+                print("Hold Power + Back for 5s to forget BLE...")
+            elif time.ticks_diff(now, self._forget_combo_start) >= self._forget_combo_duration:
+                self._perform_ble_forget()
+                self._forget_combo_start = 0
+        else:
+            if self._forget_combo_start != 0:
+                print("Cancelled")
+            self._forget_combo_start = 0
+
+    def _perform_ble_forget(self):
+        """Clear BLE bonds and restart advertising."""
+        print("Forgetting BLE bonds...")
+        self.set_led(COLOR_RED)
+
+        # Clear stored keys
+        self.kb.secrets.clear_secrets()
+        self.kb.secrets.save_secrets()
+
+        # Disconnect if connected
+        if self._connected:
+            self.kb.stop()
+            time.sleep_ms(500)
+            self.kb.start()
+            self._connected = False
+
+        # Restart advertising
+        self._ble_ready = True
+        self.kb.start_advertising()
+        self.set_led(COLOR_BLUE)
+        print("BLE reset - ready to pair")
 
     def set_led(self, color):
         """Set LED color (GRB tuple)."""
@@ -391,6 +437,7 @@ class ShieldRemote:
         # Main loop with power management
         while True:
             self._handle_buttons()
+            self._check_forget_combo()
             self._update_battery()
             self._ensure_advertising()
             self._check_idle_timeout()

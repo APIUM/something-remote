@@ -48,6 +48,10 @@ class KeyStore:
         _key = (sec_type, bytes(key))
         return _key in self.secrets
 
+    def clear_secrets(self):
+        """Remove all stored secrets."""
+        self.secrets = {}
+
     def get_json_secrets(self):
         return [
             (sec_type, binascii.b2a_base64(key, newline=False).decode(),
