@@ -1,5 +1,5 @@
 # MicroPython main entry point
-# Auto-starts Shield Remote on boot
+# Auto-starts Something Remote on boot
 
 import time
 from machine import Pin
@@ -7,7 +7,7 @@ from machine import Pin
 # Hold SELECT (GPIO22) during boot to skip auto-start
 SKIP_PIN = 22
 
-print("Shield Remote - boot")
+print("Something Remote - boot")
 
 # Check if SELECT button is held (active LOW)
 skip_btn = Pin(SKIP_PIN, Pin.IN, Pin.PULL_UP)
