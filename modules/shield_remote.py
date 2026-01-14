@@ -9,9 +9,10 @@ import time
 import sys
 from neopixel import NeoPixel
 from hid_services import Keyboard
-from config import config
+from config import config, POWER_MODE_BLE, POWER_MODE_HA
 from ha_client import ha_client
 from logger import log
+from mpu6050_wake import mpu6050
 
 # Everything Remote GPIO assignments
 PIN_POWER = 0         # Strapping pin - needs care
@@ -37,8 +38,12 @@ PIN_SHORTCUT_1 = 34   # Input-only, no internal pull-up
 PIN_SHORTCUT_2 = 35   # Shared with battery ADC (LOLIN voltage divider)
 PIN_BATTERY = 35      # Same as SHORTCUT_2 - dual use
 
-# Status LED (directly on GPIO, optional external NeoPixel)
-LED_PIN = 21          # Or use onboard LED if available
+# Accelerometer interrupt pin for motion wake
+PIN_ACCEL_INT = 36    # Input-only, RTC capable for wake
+
+# Status LED (optional - Everything Remote board has no LED)
+HAS_LED = False       # Set to True if you add a NeoPixel LED
+LED_PIN = 21          # GPIO for external NeoPixel if added
 
 # RTC GPIO pins that can wake from deep sleep
 # These are the button pins that are also RTC-capable
@@ -59,10 +64,10 @@ WAKE_PINS = [
 ]
 
 # Power management settings
-IDLE_TIMEOUT_CONNECTED_MS = 30 * 60 * 1000  # 30 minutes when connected
-IDLE_TIMEOUT_DISCONNECTED_MS = 2 * 60 * 1000  # 2 minutes when not connected
+IDLE_TIMEOUT_CONNECTED_MS = 5 * 60 * 1000  # 5 minutes before light sleep
+IDLE_TIMEOUT_DISCONNECTED_MS = 5 * 60 * 1000  # 5 minutes before light sleep
 LIGHT_SLEEP_MS = 50               # Light sleep interval between polls
-DEEP_SLEEP_AFTER_MS = 3 * 60 * 60 * 1000  # 3 hours of light sleep before deep sleep
+DEEP_SLEEP_AFTER_MS = 60 * 60 * 1000  # 1 hour of light sleep before deep sleep
 
 # HID key codes (USB HID Keyboard Usage Tables - Page 0x07)
 KEY_UP = 0x52
@@ -136,12 +141,13 @@ BLE_BUTTONS = [
 
 # Home Assistant Button definitions: (pin, ha_action, name, has_pullup, is_adc)
 # These buttons send MQTT messages to Home Assistant
+# Note: Shortcut4 (GPIO33) shared with I2C SDA - I2C released after boot so button works
+# Note: Power button is handled separately based on config.power_button_mode
 HA_BUTTONS = [
-    (PIN_POWER, "power", "Power", True, False),  # Power via HA (works when Shield is off)
     (PIN_SHORTCUT_1, "shortcut_1", "Shortcut1", False, False),
     (PIN_SHORTCUT_2, "shortcut_2", "Shortcut2", False, True),  # ADC-based (shared with battery)
     (PIN_SHORTCUT_3, "shortcut_3", "Shortcut3", True, False),
-    (PIN_SHORTCUT_4, "shortcut_4", "Shortcut4", True, False),
+    (PIN_SHORTCUT_4, "shortcut_4", "Shortcut4", True, False),  # Shared with I2C SDA at boot
     (PIN_BRIGHT_UP, "brightness_up", "Bright+", True, False),
     (PIN_BRIGHT_DOWN, "brightness_down", "Bright-", True, False),
 ]
@@ -155,13 +161,14 @@ class ShieldRemote:
     """BLE HID remote control for Nvidia Shield + Home Assistant."""
 
     def __init__(self, name="Something Remote"):
-        # Try to initialize LED (may not be present)
+        # Initialize LED if enabled (Everything Remote has no onboard LED)
         self.led = None
-        try:
-            self.led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
-            self.set_led(COLOR_OFF)
-        except Exception:
-            print("No NeoPixel LED on GPIO", LED_PIN)
+        if HAS_LED:
+            try:
+                self.led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
+                self.set_led(COLOR_OFF)
+            except Exception:
+                print("LED init failed on GPIO", LED_PIN)
 
         # Track if BLE is fully initialized
         self._ble_ready = False
@@ -195,6 +202,10 @@ class ShieldRemote:
                 btn = Pin(pin_num, Pin.IN)
             self.ha_buttons.append((btn, action, name, is_adc))
             self.ha_button_states.append(1)  # Initial state (not pressed)
+
+        # Power button - handled separately based on config.power_button_mode
+        self._power_btn = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
+        self._power_btn_state = 1  # Initial state (not pressed)
 
         # State tracking
         self._connected = False
@@ -230,22 +241,33 @@ class ShieldRemote:
         self._light_sleep_start = 0  # When we first entered light sleep mode
 
     def _setup_wake_pins(self):
-        """Configure GPIO pins for light sleep wake (any button)."""
+        """Configure GPIO pins for deep sleep wake only."""
+        # Note: Light sleep now uses timed sleep + polling instead of IRQ wake
+        # (IRQ wake was causing reboots instead of proper wake)
         self._wake_pin_objects = []
         for pin_num in WAKE_PINS:
             pin = Pin(pin_num, Pin.IN, Pin.PULL_UP)
-            # Enable wake from light sleep on falling edge (button press)
-            pin.irq(trigger=Pin.IRQ_FALLING, wake=machine.SLEEP)
             self._wake_pin_objects.append(pin)
         log(f"Configured {len(self._wake_pin_objects)} wake pins")
 
+    def _check_any_button_pressed(self):
+        """Check if any button is currently pressed."""
+        # Check wake pins (most buttons)
+        for pin in self._wake_pin_objects:
+            if pin.value() == 0:
+                return True
+        # Check ADC button (Shortcut2 on GPIO35)
+        if self._battery_adc.read() < ADC_BUTTON_THRESHOLD:
+            return True
+        return False
+
     def _enter_light_sleep(self):
-        """Enter light sleep mode, wake on ANY button press."""
+        """Enter light sleep mode, wake on POWER button, motion, or timeout."""
         # Track when we first started light sleeping
         now = time.ticks_ms()
         if self._light_sleep_start == 0:
             self._light_sleep_start = now
-            log("LIGHT SLEEP - first entry, any button wakes")
+            log("LIGHT SLEEP - entering (POWER/motion wake + 500ms timeout)")
 
         # Check if we've been in light sleep mode too long -> deep sleep
         light_sleep_duration = time.ticks_diff(now, self._light_sleep_start)
@@ -255,29 +277,56 @@ class ShieldRemote:
 
         self.set_led(COLOR_OFF)
 
-        # Use light sleep - can wake on any GPIO interrupt
-        # Wake pins already configured with IRQ in _setup_wake_pins()
-        lightsleep()
+        # Configure ext0 wake on POWER button (GPIO0)
+        power_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
+        esp32.wake_on_ext0(power_pin, 0)  # Wake on LOW (button pressed)
 
-        # Woke up! Log and reset activity timer
-        log("WOKE UP from light sleep")
-        self._reset_activity()
-        # Don't reset _light_sleep_start - we're still in "sleep mode" until real activity
-        if self._connected:
-            self.set_led(COLOR_GREEN)
-        else:
-            self.set_led(COLOR_BLUE)
+        # Configure ext1 wake on accelerometer INT (GPIO36) if available
+        if mpu6050.is_initialized:
+            try:
+                accel_int = Pin(PIN_ACCEL_INT, Pin.IN)
+                esp32.wake_on_ext1([accel_int], esp32.WAKEUP_ANY_HIGH)
+            except:
+                pass
+
+        # Light sleep with timeout - allows polling other buttons periodically
+        # ext0/ext1 will wake immediately, otherwise wake after 500ms
+        lightsleep(500)
+
+        # Check if any button pressed or motion detected
+        if self._check_any_button_pressed() or (mpu6050.is_initialized and mpu6050.check_motion()):
+            log("WOKE UP from light sleep - activity detected")
+            self._reset_activity()
+            self._light_sleep_start = 0  # Reset - real activity detected
+            if self._connected:
+                self.set_led(COLOR_GREEN)
+            else:
+                self.set_led(COLOR_BLUE)
+        # If no activity, we'll come back here on next idle timeout check
 
     def _enter_deep_sleep(self):
-        """Enter deep sleep mode, wake on POWER button only."""
-        log("DEEP SLEEP - entering after 3h light sleep, POWER button wakes")
+        """Enter deep sleep mode, wake on POWER button or motion."""
+        log("DEEP SLEEP - configuring wake sources")
         self.set_led(COLOR_OFF)
 
-        # Use ext0 wake on single pin (POWER button = GPIO0)
-        # ext0 level: 0 = wake on LOW, 1 = wake on HIGH
-        wake_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
-        esp32.wake_on_ext0(wake_pin, 0)
+        # ext0: POWER button (GPIO0) - wake on LOW (button pressed)
+        power_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
+        try:
+            esp32.wake_on_ext0(power_pin, 0)
+            log("DEEP SLEEP - ext0 configured (POWER button)")
+        except Exception as e:
+            log(f"DEEP SLEEP - ext0 error: {e}")
 
+        # ext1: Accelerometer INT (GPIO36) - wake on HIGH (motion detected)
+        if mpu6050.is_initialized:
+            try:
+                accel_int = Pin(PIN_ACCEL_INT, Pin.IN)
+                esp32.wake_on_ext1([accel_int], esp32.WAKEUP_ANY_HIGH)
+                log("DEEP SLEEP - ext1 configured (motion wake)")
+            except Exception as e:
+                log(f"DEEP SLEEP - ext1 error: {e}")
+
+        log("DEEP SLEEP - entering now (POWER or motion wakes)")
         deepsleep()
 
     def _check_idle_timeout(self):
@@ -334,13 +383,20 @@ class ShieldRemote:
         if power_pressed and back_pressed:
             if self._forget_combo_start == 0:
                 self._forget_combo_start = now
-                print("Hold Power + Back for 5s to forget BLE...")
-            elif time.ticks_diff(now, self._forget_combo_start) >= self._forget_combo_duration:
-                self._perform_ble_forget()
-                self._forget_combo_start = 0
+                log("COMBO: Power+Back detected, hold for 5s...")
+            else:
+                elapsed = time.ticks_diff(now, self._forget_combo_start)
+                # Log progress every second
+                if elapsed > 0 and elapsed % 1000 < 60:
+                    log(f"COMBO: holding... {elapsed//1000}s")
+                if elapsed >= self._forget_combo_duration:
+                    log("COMBO: Success! Triggering BLE forget")
+                    self._perform_ble_forget()
+                    self._forget_combo_start = 0
         else:
             if self._forget_combo_start != 0:
-                print("Cancelled")
+                elapsed = time.ticks_diff(now, self._forget_combo_start)
+                log(f"COMBO: Power+Back released after {elapsed}ms")
             self._forget_combo_start = 0
 
     def _perform_ble_forget(self):
@@ -351,19 +407,21 @@ class ShieldRemote:
         # Clear stored keys
         self.kb.secrets.clear_secrets()
         self.kb.secrets.save_secrets()
+        log("BLE FORGET - secrets cleared")
 
-        # Disconnect if connected
-        if self._connected:
-            self.kb.stop()
-            time.sleep_ms(500)
-            self.kb.start()
-            self._connected = False
+        # Always restart BLE stack to clear cached bonding state
+        log("BLE FORGET - restarting BLE stack")
+        self.kb.stop()
+        time.sleep_ms(500)
+        self.kb.start()
+        self._connected = False
+        time.sleep_ms(100)
 
         # Restart advertising
         self._ble_ready = True
         self.kb.start_advertising()
         self.set_led(COLOR_BLUE)
-        print("BLE reset - ready to pair")
+        log("BLE FORGET - now advertising, ready to pair")
 
     def _check_setup_combo(self):
         """Check if Shortcut1 + Shortcut3 held for 5 seconds to enter setup."""
@@ -376,13 +434,21 @@ class ShieldRemote:
         if s1_pressed and s3_pressed:
             if self._setup_combo_start == 0:
                 self._setup_combo_start = now
-                print("Hold Shortcut1 + Shortcut3 for 5s for setup...")
-            elif time.ticks_diff(now, self._setup_combo_start) >= self._setup_combo_duration:
-                self._enter_setup_portal()
-                self._setup_combo_start = 0
+                log("COMBO: S1+S3 detected, hold for 5s for setup...")
+                self.set_led(COLOR_YELLOW)  # Visual feedback
+            else:
+                elapsed = time.ticks_diff(now, self._setup_combo_start)
+                if elapsed >= self._setup_combo_duration:
+                    self._enter_setup_portal()
+                    self._setup_combo_start = 0
         else:
             if self._setup_combo_start != 0:
-                print("Cancelled")
+                log("COMBO: S1+S3 cancelled")
+                # Restore LED color
+                if self._connected:
+                    self.set_led(COLOR_GREEN)
+                else:
+                    self.set_led(COLOR_BLUE)
             self._setup_combo_start = 0
 
     def _enter_setup_portal(self):
@@ -443,6 +509,34 @@ class ShieldRemote:
             ha_client.send_battery(percent, voltage)
         else:
             log("HA not configured - hold Shortcut1+3 for setup")
+
+    def _handle_power_button(self):
+        """Handle power button based on config.power_button_mode."""
+        now = time.ticks_ms()
+
+        # Debounce check
+        if time.ticks_diff(now, self._last_press_time) < self._debounce_ms:
+            return
+
+        state = self._power_btn.value()
+        if state != self._power_btn_state:
+            self._last_press_time = now
+            self._power_btn_state = state
+            if state == 0:  # Pressed
+                self._reset_activity(from_button=True)
+                if config.power_button_mode == POWER_MODE_BLE:
+                    # Send BLE Consumer Control Power command
+                    self.set_led(COLOR_WHITE)
+                    self._send_key(CC_POWER, "Power", TYPE_CONSUMER)
+                    self._any_pressed = True
+                else:
+                    # Send to Home Assistant (default)
+                    self.set_led(COLOR_PURPLE)
+                    self._send_ha_button("power", "Power")
+                    self._any_pressed = True
+            else:  # Released
+                if config.power_button_mode == POWER_MODE_BLE:
+                    self._release_keys()
 
     def set_led(self, color):
         """Set LED color (GRB tuple)."""
@@ -518,13 +612,16 @@ class ShieldRemote:
             if btn_type == TYPE_CONSUMER:
                 self.kb.set_consumer(code)
                 self.kb.notify_consumer_report()
+                log(f"BLE key: {name} (Consumer 0x{code:02X})")
             else:
                 self.kb.set_keys(code)
                 self.kb.notify_hid_report()
+                log(f"BLE key: {name} (Key 0x{code:02X})")
             self._active_type = btn_type
-            if name:
-                print(f"{name} pressed")
             return True
+        else:
+            if name:
+                log(f"BLE key: {name} - NOT CONNECTED, not sent")
         return False
 
     def _release_keys(self):
@@ -574,8 +671,11 @@ class ShieldRemote:
                 any_ha_pressed = True
                 break
 
+        # Check power button
+        power_pressed = self._power_btn.value() == 0
+
         # Reset LED if no buttons pressed
-        if not (any_ble_pressed or any_ha_pressed) and self._any_pressed:
+        if not (any_ble_pressed or any_ha_pressed or power_pressed) and self._any_pressed:
             self._any_pressed = False
             if self._connected:
                 self.set_led(COLOR_GREEN)
@@ -634,10 +734,19 @@ class ShieldRemote:
         config.load()
         if config.is_configured:
             log(f"HA configured: {config.mqtt_host}")
+            power_mode = "BLE" if config.power_button_mode == POWER_MODE_BLE else "Home Assistant"
+            log(f"Power button: {power_mode}")
         else:
             log("HA not configured - entering setup")
             self._enter_setup_portal()
             return  # Won't reach here, portal resets
+
+        # Initialize accelerometer for motion wake
+        log("Initializing MPU6050 accelerometer...")
+        if mpu6050.init():
+            log("MPU6050 ready - motion wake enabled")
+        else:
+            log("MPU6050 not found - motion wake disabled")
 
         # Start BLE services
         log("Starting BLE services")
@@ -667,6 +776,9 @@ class ShieldRemote:
                 if loop_count < 3:
                     log(f"Loop {loop_count}: ha_buttons")
                 self._handle_ha_buttons()
+                if loop_count < 3:
+                    log(f"Loop {loop_count}: power_button")
+                self._handle_power_button()
                 if loop_count < 3:
                     log(f"Loop {loop_count}: forget_combo")
                 self._check_forget_combo()
@@ -704,11 +816,12 @@ class ShieldRemote:
 def main():
     """Entry point with error handling."""
     led = None
-    try:
+    if HAS_LED:
         try:
             led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
         except Exception:
             pass
+    try:
         remote = ShieldRemote()
         remote.run()
     except MemoryError as e:

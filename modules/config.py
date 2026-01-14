@@ -3,6 +3,10 @@
 
 import json
 
+# Power button mode constants
+POWER_MODE_HA = "ha"    # Send power command to Home Assistant
+POWER_MODE_BLE = "ble"  # Send BLE Consumer Control power command
+
 try:
     import esp32
     HAS_NVS = True
@@ -25,6 +29,7 @@ class Config:
         "mqtt_password": "",
         "device_name": "something_remote",
         "configured": False,
+        "power_button_mode": POWER_MODE_HA,  # POWER_MODE_HA or POWER_MODE_BLE
     }
 
     def __init__(self):
@@ -156,6 +161,14 @@ class Config:
 
     def set_configured(self, value=True):
         self._config["configured"] = value
+
+    @property
+    def power_button_mode(self):
+        return self._config.get("power_button_mode", POWER_MODE_HA)
+
+    @power_button_mode.setter
+    def power_button_mode(self, value):
+        self._config["power_button_mode"] = value
 
 
 # Global config instance

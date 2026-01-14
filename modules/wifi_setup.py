@@ -4,7 +4,7 @@
 import network
 import socket
 import time
-from config import config
+from config import config, POWER_MODE_BLE, POWER_MODE_HA
 from microdot import Microdot, Response
 
 app = Microdot()
@@ -21,9 +21,12 @@ HTML_PAGE = """<!DOCTYPE html>
         h1{{color:#0f0}}
         form{{max-width:400px}}
         label{{display:block;margin-top:15px;color:#aaa}}
-        input{{width:100%;padding:10px;margin-top:5px;border:1px solid #444;background:#16213e;color:#fff;border-radius:4px;box-sizing:border-box}}
+        input[type="text"],input[type="password"],input[type="number"]{{width:100%;padding:10px;margin-top:5px;border:1px solid #444;background:#16213e;color:#fff;border-radius:4px;box-sizing:border-box}}
         button{{margin-top:20px;padding:12px 30px;background:#0f0;color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:bold}}
         .section{{margin-top:25px;padding-top:15px;border-top:1px solid #333}}
+        .radio-group{{margin-top:10px}}
+        .radio-group label{{display:flex;align-items:center;margin-top:8px;cursor:pointer}}
+        .radio-group input[type="radio"]{{width:auto;margin-right:10px}}
     </style>
 </head>
 <body>
@@ -46,6 +49,13 @@ HTML_PAGE = """<!DOCTYPE html>
             <input type="text" name="mqtt_user" value="{mqtt_user}">
             <label>Password (optional)</label>
             <input type="password" name="mqtt_password" value="{mqtt_password}">
+        </div>
+        <div class="section">
+            <h3>Power Button Functionality</h3>
+            <div class="radio-group">
+                <label><input type="radio" name="power_button_mode" value="ha" {power_ha_checked}> Custom Home Assistant Trigger</label>
+                <label><input type="radio" name="power_button_mode" value="ble" {power_ble_checked}> BLE Power Command</label>
+            </div>
         </div>
         <button type="submit">Save & Restart</button>
     </form>
@@ -74,6 +84,7 @@ HTML_SUCCESS = """<!DOCTYPE html>
 @app.route('/')
 async def index(request):
     """Main setup page."""
+    power_mode = config.power_button_mode
     html = HTML_PAGE.format(
         wifi_ssid=config.wifi_ssid,
         wifi_password=config.wifi_password,
@@ -81,6 +92,8 @@ async def index(request):
         mqtt_port=config.mqtt_port,
         mqtt_user=config.mqtt_user,
         mqtt_password=config.mqtt_password,
+        power_ha_checked='checked' if power_mode == POWER_MODE_HA else '',
+        power_ble_checked='checked' if power_mode == POWER_MODE_BLE else '',
     )
     return html, 200, {'Content-Type': 'text/html'}
 
@@ -96,6 +109,7 @@ async def save(request):
     config.mqtt_port = int(form.get('mqtt_port', 1883))
     config.mqtt_user = form.get('mqtt_user', '')
     config.mqtt_password = form.get('mqtt_password', '')
+    config.power_button_mode = form.get('power_button_mode', POWER_MODE_HA)
     config.set_configured(True)
     config.save()
 
