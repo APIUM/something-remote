@@ -7,6 +7,7 @@ from micropython import const
 import struct
 import bluetooth
 from bluetooth import UUID
+import esp32
 from hid_keystores import DefaultKeyStore
 
 # BLE flags
@@ -243,6 +244,20 @@ class HumanInterfaceDevice:
 
     def start(self):
         if self.device_state == self.DEVICE_STOPPED:
+            # Clear NimBLE's internal bonding state to prevent IRK conflicts
+            # This ensures Python keystore is the sole source of bonding data
+            # Without this, deep sleep causes "failed to configure restored IRK" errors
+            try:
+                nvs = esp32.NVS("nimble_bond")
+                for key in ["cccd", "peer_id", "our_id", "peer_sec", "our_sec"]:
+                    try:
+                        nvs.erase_key(key)
+                    except:
+                        pass
+                nvs.commit()
+            except:
+                pass  # Namespace may not exist on first boot
+
             self.secrets.load_secrets()
             self._ble.irq(self.ble_irq)
             self._ble.active(True)
