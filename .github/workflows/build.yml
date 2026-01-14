@@ -1,0 +1,56 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [master]
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="${{ github.sha }}"
+            VERSION="${VERSION:0:7}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Build Docker image
+        run: docker build -t something-remote-build .
+
+      - name: Build firmware
+        run: |
+          docker run --rm -v "$PWD:/project" -w /project something-remote-build \
+            make build BOARD=EVERYTHING_REMOTE
+
+      - name: Merge firmware bins
+        run: |
+          pip install esptool
+          esptool.py --chip esp32 merge_bin -o something-remote-${{ steps.version.outputs.version }}.bin \
+            --flash_mode dio --flash_size 4MB \
+            0x1000 build/bootloader.bin \
+            0x8000 build/partition-table.bin \
+            0x10000 build/micropython.bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: something-remote-firmware
+          path: something-remote-${{ steps.version.outputs.version }}.bin
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: something-remote-${{ steps.version.outputs.version }}.bin
