@@ -8,6 +8,8 @@ I found the HA actions on the original for navigation on the Shield had much too
 
 For the HA actions I use MQTT auto-discovery with triggers for the buttons. To set up an automation in HA (after doing the WiFi setup including your MQTT broker), target the device as "Something Remote" and use the trigger dropdown to select the button you want. Remember to set the automation mode to "queued" if you want multiple presses to all process (e.g., for dimming a light).
 
+I've also added an MPU6050 to enable lift to wake as I didn't like having to press the power button just to make another input. This is optional, if it's not found at boot then it will just use the power button in a similar way to the original. Ensure it's wired as stated below.
+
 ## Re-pairing
 
 - **BLE**: Hold **Power + Back** for 5 seconds
