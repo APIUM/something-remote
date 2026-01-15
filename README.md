@@ -118,8 +118,8 @@ Hold **Shortcut1 + Shortcut3** for 5 seconds. LED turns yellow.
 
 ## Power Management
 
-- **1 minute** idle → Light sleep (BLE stays active)
-- **5 minutes** of light sleep → Deep sleep
+- **5 minutes** idle → Light sleep (BLE stays active)
+- **1 hour** of light sleep → Deep sleep
 - **Wake**: Any button press or motion (if MPU6050 installed)
 
 ## Build
