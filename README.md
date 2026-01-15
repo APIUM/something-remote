@@ -12,8 +12,8 @@ I've also added an MPU6050 to enable lift to wake as I didn't like having to pre
 
 ## Re-pairing
 
-- **BLE**: Hold **Power + Back** for 5 seconds
-- **WiFi/MQTT**: Hold **Shortcut1 + Shortcut3** for 5 seconds
+- **BLE**: Hold **Power + Back** for 10 seconds
+- **WiFi/MQTT**: Hold **Shortcut1 + Shortcut3** for 10 seconds
 
 ## Config
 
@@ -65,8 +65,8 @@ Get `something-remote-firmware.bin` from [Releases](../../releases/latest).
 
 | Combo | Hold Time | Action |
 |-------|-----------|--------|
-| **Power + Back** | 5 seconds | Clear BLE bonds, restart advertising (for pairing) |
-| **Shortcut1 + Shortcut3** | 5 seconds | Enter WiFi/MQTT setup portal |
+| **Power + Back** | 10 seconds | Clear BLE bonds, restart advertising (for pairing) |
+| **Shortcut1 + Shortcut3** | 10 seconds | Enter WiFi/MQTT setup portal |
 
 ## Button Mapping
 
@@ -95,13 +95,13 @@ Get `something-remote-firmware.bin` from [Releases](../../releases/latest).
 
 ### Pairing with Shield
 
-1. Hold **Power + Back** for 5 seconds to ensure device is advertising
+1. Hold **Power + Back** for 10 seconds to ensure device is advertising
 2. On Shield: Settings → Remote & Accessories → Add Accessory
 3. Select "Something Remote"
 
 ### Re-entering Setup
 
-Hold **Shortcut1 + Shortcut3** for 5 seconds.
+Hold **Shortcut1 + Shortcut3** for 10 seconds.
 
 ## Power Management
 
@@ -153,9 +153,9 @@ make -C mpy-cross
 
 ## Troubleshooting
 
-- **Can't pair**: Hold Power + Back 5 sec to clear bonds, then retry
+- **Can't pair**: Hold Power + Back 10 sec to clear bonds, then retry
 - **Can't see in Shield menu**: Try nRF Connect app to verify device is advertising
-- **WiFi issues**: Hold Shortcut1 + Shortcut3 5 sec to re-enter setup
+- **WiFi issues**: Hold Shortcut1 + Shortcut3 10 sec to re-enter setup
 - **Debug output**: `screen /dev/ttyUSB0 115200`
 
 ## License
