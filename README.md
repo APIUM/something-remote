@@ -61,17 +61,6 @@ Get `something-remote-firmware.bin` from [Releases](../../releases/latest).
 
 4. **Pair**: See [Pairing with Shield](#pairing-with-shield) below
 
-## LED Status
-
-| Color | State |
-|-------|-------|
-| Blue | Advertising (ready to pair) |
-| Green | Connected to Shield |
-| White | Button pressed |
-| Purple | Home Assistant activity |
-| Yellow | Setup portal active |
-| Red | Error or BLE forget |
-
 ## Button Combos
 
 | Combo | Hold Time | Action |
@@ -106,15 +95,13 @@ Get `something-remote-firmware.bin` from [Releases](../../releases/latest).
 
 ### Pairing with Shield
 
-1. Ensure LED is **blue** (advertising)
-2. If not blue, hold **Power + Back** for 5 seconds
-3. On Shield: Settings → Remote & Accessories → Add Accessory
-4. Select "Something Remote"
-5. LED turns **green** when connected
+1. Hold **Power + Back** for 5 seconds to ensure device is advertising
+2. On Shield: Settings → Remote & Accessories → Add Accessory
+3. Select "Something Remote"
 
 ### Re-entering Setup
 
-Hold **Shortcut1 + Shortcut3** for 5 seconds. LED turns yellow.
+Hold **Shortcut1 + Shortcut3** for 5 seconds.
 
 ## Power Management
 
@@ -167,7 +154,7 @@ make -C mpy-cross
 ## Troubleshooting
 
 - **Can't pair**: Hold Power + Back 5 sec to clear bonds, then retry
-- **Can't see in Shield menu**: Check LED is blue, try nRF Connect app to verify advertising
+- **Can't see in Shield menu**: Try nRF Connect app to verify device is advertising
 - **WiFi issues**: Hold Shortcut1 + Shortcut3 5 sec to re-enter setup
 - **Debug output**: `screen /dev/ttyUSB0 115200`
 
