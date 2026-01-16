@@ -64,10 +64,10 @@ WAKE_PINS = [
 ]
 
 # Power management settings
-IDLE_TIMEOUT_CONNECTED_MS = 5 * 60 * 1000  # 5 minutes before light sleep
-IDLE_TIMEOUT_DISCONNECTED_MS = 5 * 60 * 1000  # 5 minutes before light sleep
+IDLE_TIMEOUT_CONNECTED_MS = 30 * 1000  # 30 seconds before light sleep
+IDLE_TIMEOUT_DISCONNECTED_MS = 30 * 1000  # 30 seconds before light sleep
 LIGHT_SLEEP_MS = 50               # Light sleep interval between polls
-DEEP_SLEEP_AFTER_MS = 60 * 60 * 1000  # 1 hour of light sleep before deep sleep
+DEEP_SLEEP_AFTER_MS = 60 * 1000  # 1 minute of light sleep before deep sleep
 
 # HID key codes (USB HID Keyboard Usage Tables - Page 0x07)
 KEY_UP = 0x52

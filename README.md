@@ -105,8 +105,8 @@ Hold **Shortcut1 + Shortcut3** for 10 seconds.
 
 ## Power Management
 
-- **5 minutes** idle → Light sleep (BLE stays active)
-- **1 hour** of light sleep → Deep sleep
+- **30 seconds** idle → Light sleep (BLE stays active)
+- **1 minute** of light sleep → Deep sleep
 - **Wake**: Any button press or motion (if MPU6050 installed)
 
 ## Build

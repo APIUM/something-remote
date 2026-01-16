@@ -18,6 +18,15 @@ F_READ_NOTIFY = bluetooth.FLAG_READ | bluetooth.FLAG_NOTIFY
 F_READ_WRITE_NORESPONSE = bluetooth.FLAG_READ | bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE
 F_READ_WRITE_NOTIFY_NORESPONSE = bluetooth.FLAG_READ | bluetooth.FLAG_WRITE | bluetooth.FLAG_NOTIFY | bluetooth.FLAG_WRITE_NO_RESPONSE
 
+# Security flags for encrypted characteristics (require pairing)
+_FLAG_READ_ENCRYPTED = const(0x0200)
+_FLAG_WRITE_ENCRYPTED = const(0x1000)
+F_READ_ENC = F_READ | _FLAG_READ_ENCRYPTED
+F_READ_NOTIFY_ENC = F_READ_NOTIFY | _FLAG_READ_ENCRYPTED
+F_READ_WRITE_ENC = F_READ_WRITE | _FLAG_READ_ENCRYPTED | _FLAG_WRITE_ENCRYPTED
+F_READ_WRITE_NORESPONSE_ENC = F_READ_WRITE_NORESPONSE | _FLAG_READ_ENCRYPTED | _FLAG_WRITE_ENCRYPTED
+F_READ_WRITE_NOTIFY_NORESPONSE_ENC = F_READ_WRITE_NOTIFY_NORESPONSE | _FLAG_READ_ENCRYPTED | _FLAG_WRITE_ENCRYPTED
+
 DSC_F_READ = const(0x02)
 
 # Advertising types
@@ -244,20 +253,6 @@ class HumanInterfaceDevice:
 
     def start(self):
         if self.device_state == self.DEVICE_STOPPED:
-            # Clear NimBLE's internal bonding state to prevent IRK conflicts
-            # This ensures Python keystore is the sole source of bonding data
-            # Without this, deep sleep causes "failed to configure restored IRK" errors
-            try:
-                nvs = esp32.NVS("nimble_bond")
-                for key in ["cccd", "peer_id", "our_id", "peer_sec", "our_sec"]:
-                    try:
-                        nvs.erase_key(key)
-                    except:
-                        pass
-                nvs.commit()
-            except:
-                pass  # Namespace may not exist on first boot
-
             self.secrets.load_secrets()
             self._ble.irq(self.ble_irq)
             self._ble.active(True)
@@ -355,19 +350,19 @@ class Keyboard(HumanInterfaceDevice):
         self.HIDS = (
             UUID(0x1812),  # Human Interface Device
             (
-                (UUID(0x2A4A), F_READ),  # HID Information
-                (UUID(0x2A4B), F_READ),  # Report Map
-                (UUID(0x2A4C), F_READ_WRITE_NORESPONSE),  # Control Point
-                (UUID(0x2A4D), F_READ_NOTIFY, (  # Input Report (Keyboard)
+                (UUID(0x2A4A), F_READ_ENC),  # HID Information
+                (UUID(0x2A4B), F_READ_ENC),  # Report Map
+                (UUID(0x2A4C), F_READ_WRITE_NORESPONSE_ENC),  # Control Point
+                (UUID(0x2A4D), F_READ_NOTIFY_ENC, (  # Input Report (Keyboard)
                     (UUID(0x2908), DSC_F_READ),  # Report Reference
                 )),
-                (UUID(0x2A4D), F_READ_WRITE_NOTIFY_NORESPONSE, (  # Output Report
+                (UUID(0x2A4D), F_READ_WRITE_NOTIFY_NORESPONSE_ENC, (  # Output Report
                     (UUID(0x2908), DSC_F_READ),
                 )),
-                (UUID(0x2A4D), F_READ_NOTIFY, (  # Input Report (Consumer)
+                (UUID(0x2A4D), F_READ_NOTIFY_ENC, (  # Input Report (Consumer)
                     (UUID(0x2908), DSC_F_READ),  # Report Reference
                 )),
-                (UUID(0x2A4E), F_READ_WRITE_NORESPONSE),  # Protocol Mode
+                (UUID(0x2A4E), F_READ_WRITE_NORESPONSE_ENC),  # Protocol Mode
             ),
         )
 

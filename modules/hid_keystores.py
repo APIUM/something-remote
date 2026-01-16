@@ -28,13 +28,17 @@ class KeyStore:
         value = None
 
         if key is None:
+            # Lookup by index
             i = 0
             for (t, _k), _val in self.secrets.items():
                 if t == sec_type:
                     if i == index:
                         value = _val
+                        break
                     i += 1
         else:
+            # Lookup by exact key only - no fallback
+            # RPA devices will need to re-pair after address change
             value = self.secrets.get(_key, None)
 
         return value

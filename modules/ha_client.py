@@ -158,7 +158,7 @@ class HomeAssistantClient:
             ("shortcut_1", "Shortcut 1"),
             ("shortcut_2", "Shortcut 2"),
             ("shortcut_3", "Shortcut 3"),
-            ("shortcut_4", "Shortcut 4"),
+            ("shortcut_4", "Shortcut 4"),  # GPIO33 shared with I2C at boot
             ("brightness_up", "Brightness Up"),
             ("brightness_down", "Brightness Down"),
         ]
