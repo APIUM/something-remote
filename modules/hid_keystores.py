@@ -37,9 +37,16 @@ class KeyStore:
                         break
                     i += 1
         else:
-            # Lookup by exact key only - no fallback
-            # RPA devices will need to re-pair after address change
+            # Try exact key match first
             value = self.secrets.get(_key, None)
+            if value is None:
+                # Fallback: return first matching sec_type (handles RPA address changes).
+                # Safe because single-peer clearing in _IRQ_SET_SECRET ensures at most
+                # one peer's keys exist.
+                for (t, _k), _val in self.secrets.items():
+                    if t == sec_type:
+                        value = _val
+                        break
 
         return value
 

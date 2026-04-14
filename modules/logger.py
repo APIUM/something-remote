@@ -33,7 +33,7 @@ def log(msg):
                     content = f.read()
                 with open(LOG_FILE, "w") as f:
                     f.write(content[len(content)//2:])
-        except:
+        except Exception:
             pass
     except Exception as e:
         print(f"Log error: {e}")
@@ -44,7 +44,7 @@ def read_log():
     try:
         with open(LOG_FILE, "r") as f:
             print(f.read())
-    except:
+    except Exception:
         print("No log file")
 
 
@@ -54,5 +54,5 @@ def clear_log():
         import os
         os.remove(LOG_FILE)
         print("Log cleared")
-    except:
+    except Exception:
         pass

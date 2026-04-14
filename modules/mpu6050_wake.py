@@ -79,7 +79,7 @@ class MPU6050Wake:
                 self._i2c = None
             # Reconfigure SDA pin as input with pull-up (for button use)
             Pin(self.sda_pin, Pin.IN, Pin.PULL_UP)
-        except:
+        except Exception:
             pass
 
     def _write_byte(self, reg, value):
@@ -139,15 +139,27 @@ class MPU6050Wake:
         return self._initialized
 
     def check_motion(self):
-        """Check if motion was detected (reads INT status)."""
+        """Check if motion was detected and clear the latched interrupt.
+
+        The INT pin latches HIGH on motion (required for deep sleep wake).
+        We briefly re-init I2C to read INT_STATUS which clears the latch,
+        then release the pins back for button use.
+        """
         if not self._initialized:
             return False
-        try:
-            # Reading INT_STATUS clears the interrupt
-            status = self._read_byte(0x3A)
-            return (status & 0x40) != 0  # MOT_INT bit
-        except:
+        if Pin(self.int_pin, Pin.IN).value() == 0:
             return False
+        # INT is HIGH — motion detected. Clear the latch via I2C.
+        try:
+            i2c = I2C(0, sda=Pin(self.sda_pin), scl=Pin(self.scl_pin), freq=400000)
+            i2c.readfrom_mem(MPU6050_ADDR, 0x3A, 1)  # Read INT_STATUS clears latch
+            del i2c
+        except Exception:
+            pass
+        # Release pins back for button use
+        Pin(self.sda_pin, Pin.IN, Pin.PULL_UP)
+        Pin(self.scl_pin, Pin.IN, Pin.PULL_UP)
+        return True
 
 
 # Singleton instance

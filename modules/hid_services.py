@@ -100,11 +100,14 @@ class Advertiser:
 
         return payload
 
-    def start_advertising(self):
+    def start_advertising(self, interval_us=100000):
         if not self.advertising:
-            # Advertise indefinitely (0 = no timeout) with 100ms interval
-            self._ble.gap_advertise(100000, adv_data=self._payload, connectable=True)
+            self._ble.gap_advertise(interval_us, adv_data=self._payload, connectable=True)
             self.advertising = True
+
+    def start_fast_advertising(self):
+        """Start advertising at 30ms interval for fast reconnection (HOGP recommended)."""
+        self.start_advertising(interval_us=30000)
 
     def stop_advertising(self):
         if self.advertising:
@@ -185,20 +188,24 @@ class HumanInterfaceDevice:
 
         self.services = [self.DIS, self.BAS]
         self.characteristics = {}
+        self._irq_events = 0  # Bitmask of pending IRQ events for main-loop logging
+        self._was_encrypted = False  # Track if encryption was established before disconnect
 
     def ble_irq(self, event, data):
         if event == _IRQ_CENTRAL_CONNECT:
             self.conn_handle, _, _ = data
+            self._was_encrypted = False
             self.set_state(self.DEVICE_CONNECTED)
-            print("Connected:", self.conn_handle)
+            self._irq_events |= 1  # connected
 
         elif event == _IRQ_CENTRAL_DISCONNECT:
+            self._was_encrypted = self.encrypted
             self.conn_handle = None
             self.encrypted = False
             self.authenticated = False
             self.bonded = False
             self.set_state(self.DEVICE_IDLE)
-            print("Disconnected")
+            self._irq_events |= 2  # disconnected
 
         elif event == _IRQ_GATTS_WRITE:
             conn_handle, attr_handle = data
@@ -223,10 +230,11 @@ class HumanInterfaceDevice:
 
         elif event == _IRQ_ENCRYPTION_UPDATE:
             _, self.encrypted, self.authenticated, self.bonded, self.key_size = data
-            print("Encryption:", self.encrypted, "Auth:", self.authenticated, "Bonded:", self.bonded)
+            self._irq_events |= 4  # encryption update
 
         elif event == _IRQ_PASSKEY_ACTION:
             conn_handle, action, passkey = data
+            self._irq_events |= 8  # passkey
             if action == _PASSKEY_ACTION_DISP:
                 self._ble.gap_passkey(conn_handle, action, self.passkey)
             elif action == _PASSKEY_ACTION_NUMCMP:
@@ -243,8 +251,20 @@ class HumanInterfaceDevice:
                     self.secrets.save_secrets()
                     return True
                 return False
+            # When a new peer bonds, clear keys from any previous peer to
+            # avoid exceeding the 512-byte NVS blob limit. A HID remote
+            # bonds with one device at a time. Keys for the same peer
+            # share the same key bytes (peer address), so only clear if
+            # we see a genuinely different peer address.
+            if sec_type in (1, 2) and key:
+                new_addr = bytes(key)
+                for (t, k) in list(self.secrets.secrets):
+                    if t == sec_type and k != new_addr:
+                        self.secrets.clear_secrets()
+                        break
             self.secrets.add_secret(sec_type, key, value)
             self.secrets.save_secrets()
+            self._irq_events |= 16  # secret stored
             return True
 
         elif event == _IRQ_GET_SECRET:
@@ -253,6 +273,11 @@ class HumanInterfaceDevice:
 
     def start(self):
         if self.device_state == self.DEVICE_STOPPED:
+            # Do NOT clear nimble_bond here — NimBLE's NVS data must stay in sync
+            # with the Python keystore for reconnection to work. Clearing creates
+            # a race condition where NimBLE reads empty NVS during init before
+            # MicroPython overrides the store callbacks.
+            # nimble_bond is only cleared during the forget combo.
             self.secrets.load_secrets()
             self._ble.irq(self.ble_irq)
             self._ble.active(True)
@@ -260,7 +285,7 @@ class HumanInterfaceDevice:
             self._ble.config(mtu=23)
             self._ble.config(bond=self.bond)
             self._ble.config(le_secure=self.le_secure)
-            self._ble.config(mitm=self.le_secure)
+            self._ble.config(mitm=False)  # Must be False with NO_INPUT_OUTPUT
             self._ble.config(io=self.io_capability)
             self.set_state(self.DEVICE_IDLE)
             print("BLE active")
@@ -316,10 +341,14 @@ class HumanInterfaceDevice:
     def set_state_change_callback(self, callback):
         self.state_change_callback = callback
 
-    def start_advertising(self):
+    def start_advertising(self, interval_us=100000):
         if self.device_state not in (self.DEVICE_STOPPED, self.DEVICE_ADVERTISING):
-            self.adv.start_advertising()
+            self.adv.start_advertising(interval_us=interval_us)
             self.set_state(self.DEVICE_ADVERTISING)
+
+    def start_fast_advertising(self):
+        """Start advertising at 30ms for fast reconnection."""
+        self.start_advertising(interval_us=30000)
 
     def stop_advertising(self):
         if self.device_state != self.DEVICE_STOPPED and self.adv:

@@ -2,7 +2,7 @@
 # Everything Remote hardware layout (21 buttons)
 # https://www.thestockpot.net/videos/theeverythingremote
 
-from machine import Pin, ADC, lightsleep, deepsleep
+from machine import Pin, ADC, deepsleep
 import machine
 import esp32
 import time
@@ -64,10 +64,20 @@ WAKE_PINS = [
 ]
 
 # Power management settings
-IDLE_TIMEOUT_CONNECTED_MS = 30 * 1000  # 30 seconds before light sleep
-IDLE_TIMEOUT_DISCONNECTED_MS = 30 * 1000  # 30 seconds before light sleep
-LIGHT_SLEEP_MS = 50               # Light sleep interval between polls
-DEEP_SLEEP_AFTER_MS = 60 * 1000  # 1 minute of light sleep before deep sleep
+# machine.lightsleep() is incompatible with BLE (MicroPython #6396) — never used.
+# Power states: ACTIVE_CONNECTED → ACTIVE_IDLE → PASSIVE_ADV → DEEP_SLEEP
+IDLE_TIMEOUT_DISCONNECTED_MS = 30 * 1000  # 30s disconnected before passive advertising
+PASSIVE_ADV_TIMEOUT_MS = 120 * 1000       # 2 min passive advertising before deep sleep
+LOOP_SLEEP_ACTIVE_MS = 50                 # 50ms polling when connected (responsive HID)
+LOOP_SLEEP_IDLE_MS = 100                  # 100ms polling when idle/advertising
+LOOP_SLEEP_PASSIVE_MS = 200               # 200ms polling in passive advertising
+CPU_FREQ_ACTIVE = 160000000               # 160MHz when connected
+CPU_FREQ_IDLE = 80000000                  # 80MHz when idle (saves ~25% power)
+
+# Power states
+STATE_ACTIVE_CONNECTED = 0
+STATE_ACTIVE_IDLE = 1
+STATE_PASSIVE_ADV = 2
 
 # HID key codes (USB HID Keyboard Usage Tables - Page 0x07)
 KEY_UP = 0x52
@@ -170,6 +180,15 @@ class ShieldRemote:
             except Exception:
                 print("LED init failed on GPIO", LED_PIN)
 
+        # Initialize accelerometer BEFORE button setup
+        # MPU6050 uses GPIO22 (SCL) and GPIO33 (SDA) for I2C, then releases them.
+        # Button init on those pins must happen after I2C is done.
+        log("Initializing MPU6050 accelerometer...")
+        if mpu6050.init():
+            log("MPU6050 ready - motion wake enabled")
+        else:
+            log("MPU6050 not found - motion wake disabled")
+
         # Track if BLE is fully initialized
         self._ble_ready = False
 
@@ -213,6 +232,8 @@ class ShieldRemote:
         self._debounce_ms = 50
         self._any_pressed = False
         self._active_type = None  # Track which report type is active
+        self._failed_connects = 0  # Track connect-without-encryption failures
+        self._bond_check_time = 0  # Time to check for stale bonds
 
         # Battery monitoring (LOLIN boards have 100k/100k divider on GPIO35)
         self._battery_adc = ADC(Pin(PIN_BATTERY))
@@ -222,12 +243,8 @@ class ShieldRemote:
 
         # Power management
         self._last_activity = time.ticks_ms()
+        self._power_state = STATE_ACTIVE_IDLE
         self._setup_wake_pins()
-
-        # Advertising check - be aggressive about staying visible
-        self._last_adv_check = 0
-        self._adv_check_interval = 5000  # Check every 5 seconds
-        self._adv_restart_count = 0  # Track how many times we've restarted advertising
 
         # BLE forget combo (Power + Back held for 5 seconds)
         self._forget_combo_start = 0
@@ -237,79 +254,59 @@ class ShieldRemote:
         self._setup_combo_start = 0
         self._setup_combo_duration = 5000  # 5 seconds
 
-        # Light sleep tracking (for transition to deep sleep)
-        self._light_sleep_start = 0  # When we first entered light sleep mode
-
     def _setup_wake_pins(self):
-        """Configure GPIO pins for deep sleep wake only."""
-        # Note: Light sleep now uses timed sleep + polling instead of IRQ wake
-        # (IRQ wake was causing reboots instead of proper wake)
-        self._wake_pin_objects = []
+        """Configure GPIO pins with pull-ups for button input."""
         for pin_num in WAKE_PINS:
-            pin = Pin(pin_num, Pin.IN, Pin.PULL_UP)
-            self._wake_pin_objects.append(pin)
-        log(f"Configured {len(self._wake_pin_objects)} wake pins")
+            Pin(pin_num, Pin.IN, Pin.PULL_UP)
+        log(f"Configured {len(WAKE_PINS)} wake pins")
 
-    def _check_any_button_pressed(self):
-        """Check if any button is currently pressed."""
-        # Check wake pins (most buttons)
-        for pin in self._wake_pin_objects:
-            if pin.value() == 0:
-                return True
-        # Check ADC button (Shortcut2 on GPIO35)
-        if self._battery_adc.read() < ADC_BUTTON_THRESHOLD:
-            return True
-        return False
+    # --- Power state transitions ---
 
-    def _enter_light_sleep(self):
-        """Enter light sleep mode, wake on POWER button, motion, or timeout."""
-        # Track when we first started light sleeping
-        now = time.ticks_ms()
-        if self._light_sleep_start == 0:
-            self._light_sleep_start = now
-            log("LIGHT SLEEP - entering (POWER/motion wake + 500ms timeout)")
+    def _transition_to_active_connected(self):
+        """Transition to ACTIVE_CONNECTED: full speed, BLE connected."""
+        if self._power_state != STATE_ACTIVE_CONNECTED:
+            self._power_state = STATE_ACTIVE_CONNECTED
+            machine.freq(CPU_FREQ_ACTIVE)
+            self.set_led(COLOR_GREEN)
+            log("Power: ACTIVE_CONNECTED (160MHz)")
 
-        # Check if we've been in light sleep mode too long -> deep sleep
-        light_sleep_duration = time.ticks_diff(now, self._light_sleep_start)
-        if light_sleep_duration >= DEEP_SLEEP_AFTER_MS:
-            self._enter_deep_sleep()
-            return
+    def _transition_to_active_idle(self):
+        """Transition to ACTIVE_IDLE: reduced speed, fast advertising."""
+        if self._power_state != STATE_ACTIVE_IDLE:
+            self._power_state = STATE_ACTIVE_IDLE
+            machine.freq(CPU_FREQ_IDLE)
+            self.set_led(COLOR_BLUE)
+            log("Power: ACTIVE_IDLE (80MHz, adv 30ms)")
+        # Ensure fast advertising is running (restart if interval needs changing)
+        if self._ble_ready and not self._connected:
+            self.kb.adv.stop_advertising()
+            time.sleep_ms(50)
+            self.kb.adv.start_advertising(interval_us=30000)
 
+    def _transition_to_passive_adv(self):
+        """Transition to PASSIVE_ADV: slow advertising, waiting for deep sleep."""
+        if self._power_state == STATE_PASSIVE_ADV:
+            return  # Already in this state
+        self._power_state = STATE_PASSIVE_ADV
         self.set_led(COLOR_OFF)
-
-        # Configure ext0 wake on POWER button (GPIO0)
-        power_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
-        esp32.wake_on_ext0(power_pin, 0)  # Wake on LOW (button pressed)
-
-        # Configure ext1 wake on accelerometer INT (GPIO36) if available
-        if mpu6050.is_initialized:
+        log("Power: PASSIVE_ADV (80MHz, adv 100ms)")
+        # Restart advertising at slower interval — use adv directly to avoid state callbacks
+        if self._ble_ready and not self._connected:
             try:
-                accel_int = Pin(PIN_ACCEL_INT, Pin.IN)
-                esp32.wake_on_ext1([accel_int], esp32.WAKEUP_ANY_HIGH)
-            except:
-                pass
-
-        # Light sleep with timeout - allows polling other buttons periodically
-        # ext0/ext1 will wake immediately, otherwise wake after 500ms
-        lightsleep(500)
-
-        # Check if any button pressed or motion detected
-        if self._check_any_button_pressed() or (mpu6050.is_initialized and mpu6050.check_motion()):
-            log("WOKE UP from light sleep - activity detected")
-            self._reset_activity()
-            self._light_sleep_start = 0  # Reset - real activity detected
-            if self._connected:
-                self.set_led(COLOR_GREEN)
-            else:
-                self.set_led(COLOR_BLUE)
-        # If no activity, we'll come back here on next idle timeout check
+                self.kb.adv.stop_advertising()
+                time.sleep_ms(50)
+                self.kb.adv.start_advertising(interval_us=100000)
+            except Exception as e:
+                log(f"Advertising error: {e}")
 
     def _enter_deep_sleep(self):
         """Enter deep sleep mode, wake on POWER button or motion."""
         log("DEEP SLEEP - configuring wake sources")
         self.set_led(COLOR_OFF)
 
-        # ext0: POWER button (GPIO0) - wake on LOW (button pressed)
+        # Configure wake sources FIRST, before BLE shutdown.
+        # ble.active(False) can reconfigure GPIO pins and interfere
+        # with wake source setup if done before.
         power_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
         try:
             esp32.wake_on_ext0(power_pin, 0)
@@ -317,7 +314,6 @@ class ShieldRemote:
         except Exception as e:
             log(f"DEEP SLEEP - ext0 error: {e}")
 
-        # ext1: Accelerometer INT (GPIO36) - wake on HIGH (motion detected)
         if mpu6050.is_initialized:
             try:
                 accel_int = Pin(PIN_ACCEL_INT, Pin.IN)
@@ -326,51 +322,79 @@ class ShieldRemote:
             except Exception as e:
                 log(f"DEEP SLEEP - ext1 error: {e}")
 
+        # Now shut down BLE gracefully
+        if self._ble_ready:
+            log("DEEP SLEEP - stopping BLE")
+            try:
+                if self._connected and self.kb.conn_handle is not None:
+                    self.kb._ble.gap_disconnect(self.kb.conn_handle)
+                    time.sleep_ms(200)
+                self.kb.stop_advertising()
+                time.sleep_ms(100)
+                self.kb.stop()
+                self._ble_ready = False
+                self._connected = False
+            except Exception as e:
+                log(f"DEEP SLEEP - BLE cleanup error: {e}")
+
         log("DEEP SLEEP - entering now (POWER or motion wakes)")
         deepsleep()
 
+    # --- Idle timeout and advertising ---
+
     def _check_idle_timeout(self):
-        """Check if we should enter deep sleep due to inactivity."""
+        """State machine: check idle time and transition power states."""
         now = time.ticks_ms()
         idle_time = time.ticks_diff(now, self._last_activity)
 
-        # Use shorter timeout when not connected
-        if self._connected:
-            timeout = IDLE_TIMEOUT_CONNECTED_MS
-        else:
-            timeout = IDLE_TIMEOUT_DISCONNECTED_MS
+        if self._power_state == STATE_ACTIVE_CONNECTED:
+            if not self._connected:
+                # Disconnected — go to idle immediately
+                self._transition_to_active_idle()
+            # While connected, stay in ACTIVE_CONNECTED regardless of idle time.
+            # The BLE connection itself keeps the device active.
 
-        if idle_time >= timeout:
-            log(f"Idle timeout: {idle_time}ms, entering light sleep")
-            self._enter_light_sleep()
+        elif self._power_state == STATE_ACTIVE_IDLE:
+            if self._connected:
+                self._transition_to_active_connected()
+            elif idle_time >= IDLE_TIMEOUT_DISCONNECTED_MS:
+                self._transition_to_passive_adv()
+
+        elif self._power_state == STATE_PASSIVE_ADV:
+            if self._connected:
+                self._transition_to_active_connected()
+            elif idle_time >= IDLE_TIMEOUT_DISCONNECTED_MS + PASSIVE_ADV_TIMEOUT_MS:
+                self._enter_deep_sleep()
 
     def _reset_activity(self, from_button=False):
         """Reset the idle timer on activity."""
         self._last_activity = time.ticks_ms()
-        # Reset light sleep tracker on real button activity
-        if from_button and self._light_sleep_start != 0:
-            log("Activity detected, resetting sleep timer")
-            self._light_sleep_start = 0
+        # If we were in a low-power state, go back to idle
+        if from_button and self._power_state == STATE_PASSIVE_ADV:
+            self._transition_to_active_idle()
 
     def _ensure_advertising(self):
-        """Make sure we're advertising if not connected - be aggressive."""
-        now = time.ticks_ms()
-        if time.ticks_diff(now, self._last_adv_check) >= self._adv_check_interval:
-            self._last_adv_check = now
-            if not self._connected and self._ble_ready:
-                # Always restart advertising to stay visible to Shield
-                # Shield may need to see fresh advertising after it wakes from standby
-                self._adv_restart_count += 1
-                try:
-                    # Stop and restart to refresh advertising data
-                    self.kb.stop_advertising()
-                    time.sleep_ms(100)
-                    self.kb.start_advertising()
-                    if self._adv_restart_count <= 3 or self._adv_restart_count % 10 == 0:
-                        log(f"Advertising refresh #{self._adv_restart_count}")
-                    self.set_led(COLOR_BLUE)
-                except Exception as e:
-                    log(f"Advertising error: {e}")
+        """Ensure advertising is running when not connected."""
+        if not self._connected and self._ble_ready:
+            if not self.kb.adv.advertising:
+                self.kb.start_advertising()
+
+    def _check_stale_bonds(self):
+        """Clear bonds if no encrypted connection within timeout after boot."""
+        if self._bond_check_time == 0:
+            return
+        if self.kb.encrypted or self.kb._was_encrypted:
+            # Encryption was established — bonds are valid
+            self._bond_check_time = 0
+            return
+        if time.ticks_diff(time.ticks_ms(), self._bond_check_time) >= 0:
+            if len(self.kb.secrets.secrets) > 1:
+                log("Stale bond timeout: no encrypted connection in 30s, clearing all bonds")
+                self._clear_all_bonds(self.kb)
+                self._bond_check_time = 0
+                log("Resetting for clean BLE state")
+                time.sleep_ms(500)
+                machine.reset()
 
     def _check_forget_combo(self):
         """Check if Power + Back held for 5 seconds to forget BLE bonds."""
@@ -399,29 +423,35 @@ class ShieldRemote:
                 log(f"COMBO: Power+Back released after {elapsed}ms")
             self._forget_combo_start = 0
 
+    @staticmethod
+    def _clear_all_bonds(kb):
+        """Clear both Python keystore and NimBLE NVS bond data."""
+        kb.secrets.clear_secrets()
+        kb.secrets.save_secrets()
+        try:
+            nvs = esp32.NVS("nimble_bond")
+            for prefix in ["peer_sec_", "our_sec_", "cccd_", "p_dev_rec_", "rpa_rec_"]:
+                for i in range(1, 16):
+                    try:
+                        nvs.erase_key(prefix + str(i))
+                    except Exception:
+                        continue
+            try:
+                nvs.erase_key("local_irk")
+            except Exception:
+                pass
+            nvs.commit()
+        except Exception:
+            pass
+
     def _perform_ble_forget(self):
-        """Clear BLE bonds and restart advertising."""
+        """Clear BLE bonds and reset device for clean pairing state."""
         log("BLE FORGET - clearing bonds")
         self.set_led(COLOR_RED)
-
-        # Clear stored keys
-        self.kb.secrets.clear_secrets()
-        self.kb.secrets.save_secrets()
-        log("BLE FORGET - secrets cleared")
-
-        # Always restart BLE stack to clear cached bonding state
-        log("BLE FORGET - restarting BLE stack")
-        self.kb.stop()
+        self._clear_all_bonds(self.kb)
+        log("BLE FORGET - secrets cleared, resetting device")
         time.sleep_ms(500)
-        self.kb.start()
-        self._connected = False
-        time.sleep_ms(100)
-
-        # Restart advertising
-        self._ble_ready = True
-        self.kb.start_advertising()
-        self.set_led(COLOR_BLUE)
-        log("BLE FORGET - now advertising, ready to pair")
+        machine.reset()
 
     def _check_setup_combo(self):
         """Check if Shortcut1 + Shortcut3 held for 5 seconds to enter setup."""
@@ -572,35 +602,63 @@ class ShieldRemote:
                 self.kb.notify_battery_level()
             log(f"Battery: {percent}% ({voltage:.2f}V)")
 
+    def _log_ble_state(self):
+        """Log BLE events from main loop context (IRQ-safe bitmask)."""
+        evts = self.kb._irq_events
+        if evts == 0:
+            return
+        self.kb._irq_events = 0
+        if evts & 1:
+            log(f"BLE IRQ: Connected handle={self.kb.conn_handle}")
+        if evts & 4:
+            log(f"BLE IRQ: Encryption enc={self.kb.encrypted} auth={self.kb.authenticated} bonded={self.kb.bonded} key_size={self.kb.key_size}")
+        if evts & 8:
+            log("BLE IRQ: Passkey action")
+        if evts & 16:
+            log(f"BLE IRQ: Secret stored ({len(self.kb.secrets.secrets)} keys)")
+        if evts & 2:
+            log("BLE IRQ: Disconnected")
+
     def _on_state_change(self):
-        """Handle BLE state changes."""
+        """Handle BLE state changes. Called from BLE IRQ via set_state callback.
+        Note: log() calls here are safe on ESP32 because NimBLE IRQs run as
+        MicroPython scheduled callbacks, not true hardware interrupts."""
         state = self.kb.get_state()
         was_connected = self._connected
 
         if state == Keyboard.DEVICE_CONNECTED:
             self._connected = True
-            self._adv_restart_count = 0  # Reset counter on successful connection
-            self.set_led(COLOR_GREEN)
-            log("BLE: Shield connected!")
-        elif state == Keyboard.DEVICE_ADVERTISING:
-            self._connected = False
-            self.set_led(COLOR_BLUE)
-            if was_connected:
-                log("BLE: Disconnected, now advertising (Shield turned off?)")
-            else:
-                log("BLE: Advertising")
+            self._reset_activity()
+            self._transition_to_active_connected()
+            # Don't cancel bond check on connect — only on encrypted connect
+            log("BLE: Connected!")
         elif state == Keyboard.DEVICE_IDLE:
             self._connected = False
-            self.set_led(COLOR_BLUE)
             if was_connected:
+                # Check if encryption was established during this connection
+                if not self.kb._was_encrypted and len(self.kb.secrets.secrets) > 1:
+                    self._failed_connects += 1
+                    log(f"BLE: Connect without encryption (fail #{self._failed_connects})")
+                    if self._failed_connects >= 3:
+                        log("BLE: Auto-clearing stale bonds after 3 failed connects")
+                        self._clear_all_bonds(self.kb)
+                        time.sleep_ms(500)
+                        machine.reset()
+                else:
+                    self._failed_connects = 0
                 log("BLE: Connection lost, restarting advertising")
-            else:
-                log("BLE: Idle, restarting advertising")
-            if self._ble_ready:
-                try:
-                    self.kb.start_advertising()
-                except Exception as e:
-                    log(f"BLE: Failed to start advertising: {e}")
+                self._transition_to_active_idle()
+                if self._ble_ready:
+                    try:
+                        self.kb.start_fast_advertising()
+                    except Exception as e:
+                        log(f"BLE: Failed to start advertising: {e}")
+        elif state == Keyboard.DEVICE_ADVERTISING:
+            # Don't change power state — this fires during advertising restarts
+            if was_connected:
+                self._connected = False
+                log("BLE: Disconnected, advertising for reconnection")
+                self._transition_to_active_idle()
         else:
             self._connected = False
             self.set_led(COLOR_OFF)
@@ -723,7 +781,7 @@ class ShieldRemote:
         """Main loop - start BLE and handle button input."""
         log("Starting Something Remote")
         log(f"BLE buttons: {len(BLE_BUTTONS)}, HA buttons: {len(HA_BUTTONS)}")
-        log(f"Power: light sleep {LIGHT_SLEEP_MS}ms, deep sleep {IDLE_TIMEOUT_DISCONNECTED_MS // 60000}m/{IDLE_TIMEOUT_CONNECTED_MS // 60000}m")
+        log(f"Power: idle {IDLE_TIMEOUT_DISCONNECTED_MS // 1000}s, passive adv {PASSIVE_ADV_TIMEOUT_MS // 1000}s")
         self.set_led(COLOR_RED)  # Initializing
 
         # Check wake reason
@@ -741,75 +799,67 @@ class ShieldRemote:
             self._enter_setup_portal()
             return  # Won't reach here, portal resets
 
-        # Initialize accelerometer for motion wake
-        log("Initializing MPU6050 accelerometer...")
-        if mpu6050.init():
-            log("MPU6050 ready - motion wake enabled")
-        else:
-            log("MPU6050 not found - motion wake disabled")
-
         # Start BLE services
         log("Starting BLE services")
         self.kb.start()
         time.sleep_ms(100)
 
-        # Mark BLE as ready and start advertising
+        # Mark BLE as ready and start fast advertising for reconnection
         self._ble_ready = True
-        self.kb.start_advertising()
+        self.kb.start_fast_advertising()
+        self._power_state = STATE_ACTIVE_IDLE
+        machine.freq(CPU_FREQ_IDLE)
         self.set_led(COLOR_BLUE)
-        log("Ready - BLE advertising as 'Something Remote'")
+        log("Ready - BLE advertising as 'Something Remote' (30ms fast)")
+
+        # Set timer to check for stale bonds (if bonded central doesn't
+        # reconnect within 30s, bonds are probably stale)
+        if len(self.kb.secrets.secrets) > 1:
+            self._bond_check_time = time.ticks_add(time.ticks_ms(), 30000)
+            log(f"Bond check: {len(self.kb.secrets.secrets)} keys stored, checking in 30s")
 
         # Initial battery reading
         percent, voltage = self._read_battery()
         self.kb.set_battery_level(percent)
         log(f"Battery: {percent}% ({voltage:.2f}V)")
 
-        # Main loop with power management
+        # Main loop with state-based power management
         log("Entering main loop")
-        loop_count = 0
         error_count = 0
         while True:
             try:
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: ble_buttons")
+                self._log_ble_state()
                 self._handle_ble_buttons()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: ha_buttons")
                 self._handle_ha_buttons()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: power_button")
                 self._handle_power_button()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: forget_combo")
                 self._check_forget_combo()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: setup_combo")
                 self._check_setup_combo()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: battery")
                 self._update_battery()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: advertising")
                 self._ensure_advertising()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: idle_timeout")
+                self._check_stale_bonds()
+
+                # Motion detection resets idle timer (keeps device awake when held)
+                if mpu6050.is_initialized and mpu6050.check_motion():
+                    self._reset_activity()
+
                 self._check_idle_timeout()
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: ha_idle")
                 ha_client.check_idle_timeout()
 
-                if loop_count < 3:
-                    log(f"Loop {loop_count}: sleep")
-                time.sleep_ms(LIGHT_SLEEP_MS)
-                loop_count += 1
-                error_count = 0  # Reset on successful loop
+                # Variable sleep based on power state
+                if self._power_state == STATE_ACTIVE_CONNECTED:
+                    time.sleep_ms(LOOP_SLEEP_ACTIVE_MS)
+                elif self._power_state == STATE_PASSIVE_ADV:
+                    time.sleep_ms(LOOP_SLEEP_PASSIVE_MS)
+                else:
+                    time.sleep_ms(LOOP_SLEEP_IDLE_MS)
+                error_count = 0
 
             except Exception as e:
                 error_count += 1
                 log(f"Loop error #{error_count}: {type(e).__name__}: {e}")
                 if error_count >= 5:
                     log("Too many errors, restarting...")
-                    raise  # Let main() handle it
+                    raise
                 time.sleep_ms(100)
 
 
@@ -838,7 +888,7 @@ def main():
             buf = io.StringIO()
             sys.print_exception(e, buf)
             log(f"Traceback: {buf.getvalue()}")
-        except:
+        except Exception:
             pass
         sys.print_exception(e)
         if led:

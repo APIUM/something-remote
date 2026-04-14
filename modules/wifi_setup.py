@@ -197,7 +197,7 @@ class CaptivePortalDNS:
             response += bytes(map(int, self.ip.split('.')))
 
             self.sock.sendto(response, addr)
-        except:
+        except Exception:
             pass
 
 
