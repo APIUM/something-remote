@@ -12,8 +12,8 @@ I've also added an MPU6050 to enable lift to wake as I didn't like having to pre
 
 ## Re-pairing
 
-- **BLE**: Hold **Power + Back** for 10 seconds
-- **WiFi/MQTT**: Hold **Shortcut1 + Shortcut3** for 10 seconds
+- **BLE**: Hold **Power + Back** for 5 seconds
+- **WiFi/MQTT**: Hold **Shortcut1 + Shortcut3** for 5 seconds
 
 ## Config
 
@@ -65,8 +65,8 @@ Get `something-remote-firmware.bin` from [Releases](../../releases/latest).
 
 | Combo | Hold Time | Action |
 |-------|-----------|--------|
-| **Power + Back** | 10 seconds | Clear BLE bonds, restart advertising (for pairing) |
-| **Shortcut1 + Shortcut3** | 10 seconds | Enter WiFi/MQTT setup portal |
+| **Power + Back** | 5 seconds | Clear BLE bonds and reset device (for re-pairing) |
+| **Shortcut1 + Shortcut3** | 5 seconds | Enter WiFi/MQTT setup portal |
 
 ## Button Mapping
 
@@ -95,19 +95,22 @@ Get `something-remote-firmware.bin` from [Releases](../../releases/latest).
 
 ### Pairing with Shield
 
-1. Hold **Power + Back** for 10 seconds to ensure device is advertising
+1. Hold **Power + Back** for 5 seconds to clear bonds and reset
 2. On Shield: Settings → Remote & Accessories → Add Accessory
 3. Select "Something Remote"
 
 ### Re-entering Setup
 
-Hold **Shortcut1 + Shortcut3** for 10 seconds.
+Hold **Shortcut1 + Shortcut3** for 5 seconds.
 
 ## Power Management
 
-- **30 seconds** idle → Light sleep (BLE stays active)
-- **1 minute** of light sleep → Deep sleep
-- **Wake**: Any button press or motion (if MPU6050 installed)
+- **30 seconds** idle (disconnected) → Passive advertising (100ms interval)
+- **2 minutes** passive advertising → Deep sleep (~10µA)
+- **Wake**: Power button or motion sensor (if MPU6050 installed)
+- While connected: stays awake at 160MHz for responsive HID
+- While idle: drops to 80MHz to save power
+- Total idle-to-deep-sleep: ~2.5 minutes
 
 ## Build
 
@@ -153,10 +156,24 @@ make -C mpy-cross
 
 ## Troubleshooting
 
-- **Can't pair**: Hold Power + Back 10 sec to clear bonds, then retry
-- **Can't see in Shield menu**: Try nRF Connect app to verify device is advertising
-- **WiFi issues**: Hold Shortcut1 + Shortcut3 10 sec to re-enter setup
+- **Can't pair**: Hold Power + Back 5 sec to clear bonds (device will reset), then retry
+- **Can't see in Shield menu**: Check Shield's location_mode and BLE Privacy settings (see below)
+- **iOS won't reconnect**: Forget "Something Remote" in iOS Bluetooth settings, then re-pair
+- **WiFi issues**: Hold Shortcut1 + Shortcut3 5 sec to re-enter setup
 - **Debug output**: `screen /dev/ttyUSB0 115200`
+- **Stale bonds**: If the device can't connect after switching centrals, wait 30s for auto-clear
+
+### Shield TV BLE Fix
+
+If the Shield can't find BLE devices, its `location_mode` may have silently reset:
+
+```bash
+adb shell settings put secure location_mode 3
+adb shell settings put global ble_scan_always_enabled 1
+adb reboot
+```
+
+Also disable **Bluetooth LE Privacy** in Shield Settings → Security & Restrictions.
 
 ## License
 
