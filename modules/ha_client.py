@@ -8,6 +8,7 @@ import json
 import ubinascii
 import machine
 import asyncio
+import network
 from config import config
 from logger import log
 
@@ -66,7 +67,9 @@ class HomeAssistantClient:
         cfg["client_id"] = self._device_id
         cfg["ssid"] = config.wifi_ssid
         cfg["wifi_pw"] = config.wifi_password
-        cfg["keepalive"] = 60
+        cfg["keepalive"] = 60         # broker drops us after 1.5x this with no traffic
+        cfg["ping_interval"] = 10     # send PINGREQ every 10s to keep TCP alive
+        cfg["response_time"] = 20     # allow 20s for PINGRESP before declaring dead
         cfg["clean"] = True
         # Non-zero queue_len is what enables mqtt_as's up/down asyncio Events
         # (see mqtt_as.py: self._events = config["queue_len"] > 0). We don't
@@ -90,6 +93,7 @@ class HomeAssistantClient:
             log("MQTT initial connect slow, continuing in background")
         except Exception as e:
             log(f"MQTT initial connect error: {e}")
+
         return True
 
     async def stop(self):
@@ -134,7 +138,8 @@ class HomeAssistantClient:
     # --- background tasks ---
 
     async def _connection_watcher(self):
-        """Re-send discovery on every (re)connect event from mqtt_as."""
+        """Re-send discovery on every (re)connect event. Spawns a down watcher."""
+        asyncio.create_task(self._down_watcher())
         while True:
             await self._client.up.wait()
             self._client.up.clear()
@@ -143,6 +148,13 @@ class HomeAssistantClient:
                 await self._send_discovery()
             except Exception as e:
                 log(f"Discovery failed: {e}")
+
+    async def _down_watcher(self):
+        """Log disconnection events (diagnostic)."""
+        while True:
+            await self._client.down.wait()
+            self._client.down.clear()
+            log("MQTT down")
 
     async def _publish_worker(self):
         """Drain the outbox onto mqtt_as.publish, which blocks until the
@@ -172,9 +184,15 @@ class HomeAssistantClient:
     # --- public synchronous API (safe from non-async handlers) ---
 
     def enqueue(self, topic, payload, retain=False):
-        """Queue a publish. Returns True if accepted, False if client not ready."""
+        """Queue a publish. Returns True if accepted, False if client not ready.
+
+        Encodes str payloads to bytes so mqtt_as uses the correct byte count
+        for the MQTT remaining-length header (it uses len(str), not len(bytes)).
+        """
         if not self._started or self._outbox is None:
             return False
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
         if len(self._outbox) >= self.OUTBOX_MAX:
             # Drop oldest — if we're this backed up, freshest data is more useful
             dropped = self._outbox.pop(0)
@@ -227,6 +245,12 @@ class HomeAssistantClient:
 
     # --- discovery ---
 
+    async def _publish_json(self, topic, obj, retain=False):
+        """Publish a dict as JSON, always as bytes. mqtt_as's publish uses
+        len(str) for the MQTT remaining-length header but sends UTF-8 bytes,
+        so a str with any non-ASCII char produces a malformed packet."""
+        await self._client.publish(topic, json.dumps(obj).encode("utf-8"), retain=retain)
+
     async def _send_discovery(self):
         """Publish retained discovery configs. Awaits mqtt_as.publish directly
         because this runs on the connection-up event, not via the outbox."""
@@ -250,29 +274,28 @@ class HomeAssistantClient:
 
         for btn_id, btn_name in buttons:
             topic = f"homeassistant/device_automation/{self._device_id}/{btn_id}/config"
-            payload = json.dumps({
+            await self._publish_json(topic, {
                 "automation_type": "trigger",
                 "type": "button_short_press",
                 "subtype": btn_id,
                 "topic": f"{self._device_id}/action",
                 "payload": btn_id,
                 "device": device_info,
-            })
-            await self._client.publish(topic, payload, retain=True)
+            }, retain=True)
 
         # Event entity: lets HA log every press in Logbook/History with
         # timestamp (device triggers don't show up there). Coexists with the
         # device-trigger discovery above — existing automations still fire.
-        event_cfg = {
-            "name": "Button",
-            "state_topic": f"{self._device_id}/event",
-            "event_types": [btn_id for btn_id, _ in buttons],
-            "unique_id": f"{self._device_id}_button",
-            "device": device_info,
-        }
-        await self._client.publish(
+        await self._publish_json(
             f"homeassistant/event/{self._device_id}/button/config",
-            json.dumps(event_cfg), retain=True,
+            {
+                "name": "Button",
+                "state_topic": f"{self._device_id}/event",
+                "event_types": [btn_id for btn_id, _ in buttons],
+                "unique_id": f"{self._device_id}_button",
+                "device": device_info,
+            },
+            retain=True,
         )
 
         # Battery sensors — only advertised if the hardware mod is installed.
@@ -286,47 +309,47 @@ class HomeAssistantClient:
             log("Discovery complete (battery disabled)")
             return
 
-        battery_cfg = {
-            "name": "Battery",
-            "device_class": "battery",
-            "unit_of_measurement": "%",
-            "state_topic": f"{self._device_id}/battery",
-            "value_template": "{{ value_json.percent }}",
-            "unique_id": f"{self._device_id}_battery",
-            "device": device_info,
-        }
-        await self._client.publish(
+        await self._publish_json(
             f"homeassistant/sensor/{self._device_id}/battery/config",
-            json.dumps(battery_cfg), retain=True,
+            {
+                "name": "Battery",
+                "device_class": "battery",
+                "unit_of_measurement": "%",
+                "state_topic": f"{self._device_id}/battery",
+                "value_template": "{{ value_json.percent }}",
+                "unique_id": f"{self._device_id}_battery",
+                "device": device_info,
+            },
+            retain=True,
         )
 
-        voltage_cfg = {
-            "name": "Battery Voltage",
-            "device_class": "voltage",
-            "unit_of_measurement": "V",
-            "state_topic": f"{self._device_id}/battery",
-            "value_template": "{{ value_json.voltage }}",
-            "unique_id": f"{self._device_id}_voltage",
-            "device": device_info,
-            "entity_category": "diagnostic",
-        }
-        await self._client.publish(
+        await self._publish_json(
             f"homeassistant/sensor/{self._device_id}/voltage/config",
-            json.dumps(voltage_cfg), retain=True,
+            {
+                "name": "Battery Voltage",
+                "device_class": "voltage",
+                "unit_of_measurement": "V",
+                "state_topic": f"{self._device_id}/battery",
+                "value_template": "{{ value_json.voltage }}",
+                "unique_id": f"{self._device_id}_voltage",
+                "device": device_info,
+                "entity_category": "diagnostic",
+            },
+            retain=True,
         )
 
-        raw_uv_cfg = {
-            "name": "Battery ADC Raw",
-            "unit_of_measurement": "µV",
-            "state_topic": f"{self._device_id}/battery",
-            "value_template": "{{ value_json.raw_uv }}",
-            "unique_id": f"{self._device_id}_battery_raw_uv",
-            "device": device_info,
-            "entity_category": "diagnostic",
-        }
-        await self._client.publish(
+        await self._publish_json(
             f"homeassistant/sensor/{self._device_id}/battery_raw_uv/config",
-            json.dumps(raw_uv_cfg), retain=True,
+            {
+                "name": "Battery ADC Raw",
+                "unit_of_measurement": "uV",  # ASCII: the unit gets displayed as "μV"-free to avoid the len-mismatch bug
+                "state_topic": f"{self._device_id}/battery",
+                "value_template": "{{ value_json.raw_uv }}",
+                "unique_id": f"{self._device_id}_battery_raw_uv",
+                "device": device_info,
+                "entity_category": "diagnostic",
+            },
+            retain=True,
         )
 
         log("Discovery complete")
