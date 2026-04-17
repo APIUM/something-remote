@@ -24,6 +24,60 @@ You can select whether the power button works over BLE or triggers a Home Assist
 - Everything Remote v1.1 board (ESP32 with 21 buttons)
 - MPU6050 accelerometer for motion wake (optional)
   - SDA: GPIO33, SCL: GPIO22, INT: GPIO36 (VP)
+- Battery voltage divider on GPIO39 (VN), optional — see below
+
+## Optional: Battery Monitoring Mod
+
+The Everything Remote PCB uses a WEMOS LOLIN32 Lite V2 module, which has a TP4054 charger but no battery voltage divider routed to any GPIO. A small hardware mod adds one, then the device reports battery level, voltage, and a diagnostic raw ADC reading to Home Assistant.
+
+Battery reporting is off by default — if you don't fit the mod, skip this section; nothing will appear in HA.
+
+### Cap and no cap options
+
+No cap — 100 k / 100 k
+
+```
+   BAT+ (JST pad)
+      │
+     [R1 100k]
+      │
+      ├─────────► VN (GPIO39)
+      │
+     [R2 100k]
+      │
+     GND
+```
+
+Cap — 1 M / 1 M + 1 µF
+
+```
+   BAT+ (JST pad)
+      │
+     [R1 1M]
+      │
+      ├──────────┬────► VN (GPIO39)
+      │          │
+     [R2 1M]    [C 1µF]
+      │          │
+      └──────────┴──── GND
+```
+
+| | No cap | Cap |
+|---|---|---|
+| Parts | 2 × through-hole resistors | 2 × resistors + 1 cap |
+| Leakage @ 4.1 V | ~21 µA | ~2 µA |
+| Cap | not needed | required (stabilises ADC sampling at high impedance) |
+
+### Enabling it in firmware
+
+Battery monitoring is gated by a config flag so boards without the mod aren't affected:
+
+1. Hold **Shortcut1 + Shortcut3** for 5 s to enter the setup portal.
+2. Tick "Enable battery monitoring" at the bottom of the form.
+3. Save — device reboots and three new entities appear on the Something Remote device in Home Assistant:
+   - Battery (%)
+   - Battery Voltage (V, diagnostic)
+   - Battery ADC Raw (µV, diagnostic)
 
 ## Features
 
