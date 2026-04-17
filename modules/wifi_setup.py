@@ -57,6 +57,12 @@ HTML_PAGE = """<!DOCTYPE html>
                 <label><input type="radio" name="power_button_mode" value="ble" {power_ble_checked}> BLE Power Command</label>
             </div>
         </div>
+        <div class="section">
+            <h3>Battery Monitoring</h3>
+            <div class="radio-group">
+                <label><input type="checkbox" name="battery_enabled" value="1" {battery_checked}> Enable (requires hardware mod: 470k/470k + 1uF to GPIO39/VN)</label>
+            </div>
+        </div>
         <button type="submit">Save & Restart</button>
     </form>
 </body>
@@ -94,6 +100,7 @@ async def index(request):
         mqtt_password=config.mqtt_password,
         power_ha_checked='checked' if power_mode == POWER_MODE_HA else '',
         power_ble_checked='checked' if power_mode == POWER_MODE_BLE else '',
+        battery_checked='checked' if config.battery_enabled else '',
     )
     return html, 200, {'Content-Type': 'text/html'}
 
@@ -110,6 +117,7 @@ async def save(request):
     config.mqtt_user = form.get('mqtt_user', '')
     config.mqtt_password = form.get('mqtt_password', '')
     config.power_button_mode = form.get('power_button_mode', POWER_MODE_HA)
+    config.battery_enabled = bool(form.get('battery_enabled'))
     config.set_configured(True)
     config.save()
 

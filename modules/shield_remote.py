@@ -34,9 +34,9 @@ PIN_SHORTCUT_3 = 32
 PIN_SHORTCUT_4 = 33
 PIN_BRIGHT_DOWN = 26
 PIN_BRIGHT_UP = 27
-PIN_SHORTCUT_1 = 34   # Input-only, no internal pull-up
-PIN_SHORTCUT_2 = 35   # Shared with battery ADC (LOLIN voltage divider)
-PIN_BATTERY = 35      # Same as SHORTCUT_2 - dual use
+PIN_SHORTCUT_1 = 34   # Input-only, external 10k pull-up (R1 on PCB)
+PIN_SHORTCUT_2 = 35   # Input-only, external 10k pull-up (R2 on PCB)
+PIN_BATTERY = 39      # VN / ADC1_CH3. Hardware mod: 470k/470k divider from VBAT + 1uF cap to GND
 
 # Accelerometer interrupt pin for motion wake
 PIN_ACCEL_INT = 36    # Input-only, RTC capable for wake
@@ -70,6 +70,34 @@ SLEEP_INHIBIT_MS = 300 * 1000            # 5 min no-sleep for initial pairing
 LOOP_SLEEP_MS = 50                       # 50ms polling
 CPU_FREQ_ACTIVE = 160000000              # 160MHz when connected
 CPU_FREQ_IDLE = 80000000                 # 80MHz when idle
+BATTERY_STALE_MS = 30 * 60 * 1000        # 30 min — republish before sleep if older
+
+# LiPo discharge curve at low load (~0.2C), resting voltage.
+# Sorted descending by voltage. Linear interp between points.
+# Sourced from typical 1S LiPo discharge data; matches Adafruit/Sparkfun tables.
+_LIPO_CURVE = (
+    (4.20, 100), (4.15,  95), (4.11,  90), (4.08,  85),
+    (4.02,  80), (3.98,  75), (3.95,  70), (3.91,  65),
+    (3.87,  60), (3.85,  55), (3.84,  50), (3.82,  45),
+    (3.80,  40), (3.79,  35), (3.77,  30), (3.75,  25),
+    (3.73,  20), (3.71,  15), (3.69,  10), (3.61,   5),
+    (3.27,   0),
+)
+
+
+def _lipo_voltage_to_percent(v):
+    """Linear-interpolate state-of-charge from the LiPo discharge curve."""
+    if v >= _LIPO_CURVE[0][0]:
+        return 100
+    if v <= _LIPO_CURVE[-1][0]:
+        return 0
+    for i in range(len(_LIPO_CURVE) - 1):
+        v_hi, p_hi = _LIPO_CURVE[i]
+        v_lo, p_lo = _LIPO_CURVE[i + 1]
+        if v_lo <= v <= v_hi:
+            frac = (v - v_lo) / (v_hi - v_lo)
+            return int(p_lo + frac * (p_hi - p_lo))
+    return 0
 
 # HID key codes (USB HID Keyboard Usage Tables - Page 0x07)
 KEY_UP = 0x52
@@ -141,22 +169,19 @@ BLE_BUTTONS = [
     (PIN_SETTINGS, KEY_F5, "Settings", True, TYPE_KEY),
 ]
 
-# Home Assistant Button definitions: (pin, ha_action, name, has_pullup, is_adc)
+# Home Assistant Button definitions: (pin, ha_action, name, has_pullup)
 # These buttons send MQTT messages to Home Assistant
+# Note: Shortcut1/Shortcut2 (GPIO34/35) are input-only; R1/R2 on the PCB provide external pull-ups
 # Note: Shortcut4 (GPIO33) shared with I2C SDA - I2C released after boot so button works
 # Note: Power button is handled separately based on config.power_button_mode
 HA_BUTTONS = [
-    (PIN_SHORTCUT_1, "shortcut_1", "Shortcut1", False, False),
-    (PIN_SHORTCUT_2, "shortcut_2", "Shortcut2", False, True),  # ADC-based (shared with battery)
-    (PIN_SHORTCUT_3, "shortcut_3", "Shortcut3", True, False),
-    (PIN_SHORTCUT_4, "shortcut_4", "Shortcut4", True, False),  # Shared with I2C SDA at boot
-    (PIN_BRIGHT_UP, "brightness_up", "Bright+", True, False),
-    (PIN_BRIGHT_DOWN, "brightness_down", "Bright-", True, False),
+    (PIN_SHORTCUT_1, "shortcut_1", "Shortcut1", False),
+    (PIN_SHORTCUT_2, "shortcut_2", "Shortcut2", False),
+    (PIN_SHORTCUT_3, "shortcut_3", "Shortcut3", True),
+    (PIN_SHORTCUT_4, "shortcut_4", "Shortcut4", True),  # Shared with I2C SDA at boot
+    (PIN_BRIGHT_UP, "brightness_up", "Bright+", True),
+    (PIN_BRIGHT_DOWN, "brightness_down", "Bright-", True),
 ]
-
-# ADC threshold for button press detection on GPIO35
-# When button pressed, ADC reads near 0. When not pressed, reads battery voltage.
-ADC_BUTTON_THRESHOLD = 500  # Below this = button pressed
 
 
 class ShieldRemote:
@@ -202,16 +227,12 @@ class ShieldRemote:
         # Initialize HA buttons
         self.ha_buttons = []
         self.ha_button_states = []
-        for pin_num, action, name, has_pullup, is_adc in HA_BUTTONS:
-            if is_adc:
-                # ADC-based button (GPIO35)
-                btn = ADC(Pin(pin_num))
-                btn.atten(ADC.ATTN_11DB)
-            elif has_pullup:
+        for pin_num, action, name, has_pullup in HA_BUTTONS:
+            if has_pullup:
                 btn = Pin(pin_num, Pin.IN, Pin.PULL_UP)
             else:
                 btn = Pin(pin_num, Pin.IN)
-            self.ha_buttons.append((btn, action, name, is_adc))
+            self.ha_buttons.append((btn, action, name))
             self.ha_button_states.append(1)  # Initial state (not pressed)
 
         # Power button - handled separately based on config.power_button_mode
@@ -226,11 +247,21 @@ class ShieldRemote:
         self._active_type = None  # Track which report type is active
         self._failed_connects = 0  # Track connect-without-encryption failures
 
-        # Battery monitoring (LOLIN boards have 100k/100k divider on GPIO35)
-        self._battery_adc = ADC(Pin(PIN_BATTERY))
-        self._battery_adc.atten(ADC.ATTN_11DB)  # Full range 0-3.3V
+        # Battery monitoring — opt-in via config.battery_enabled because it
+        # requires a hardware mod (470k/470k divider from VBAT to GPIO39/VN
+        # plus a 1uF cap to GND). Without the mod the ADC pin is floating and
+        # reporting numbers would just be noise, so we skip the whole path.
+        self._battery_enabled = config.battery_enabled
+        self._battery_adc = None
         self._last_battery_update = 0
         self._battery_update_interval = 60000  # Update every 60 seconds
+        self._last_battery_uv = 0  # Last raw ADC reading in microvolts (for debug)
+        if self._battery_enabled:
+            self._battery_adc = ADC(Pin(PIN_BATTERY))
+            self._battery_adc.atten(ADC.ATTN_11DB)
+            log("Battery monitoring: enabled (GPIO39, 2:1 divider)")
+        else:
+            log("Battery monitoring: disabled (enable in setup portal if board has mod)")
 
         # Power management
         self._last_activity = time.ticks_ms()
@@ -258,6 +289,21 @@ class ShieldRemote:
         """Enter deep sleep. Does not return."""
         log("DEEP SLEEP - entering")
         self.set_led(COLOR_OFF)
+
+        # Publish a final battery reading if our last one is stale, so we can
+        # measure sleep-drain against the post-wake reading. Skip silently if
+        # already fresh. Wrapped so network flakiness can never block sleep.
+        if self._battery_enabled and ha_client.is_configured:
+            try:
+                stale_ms = ha_client.time_since_last_battery_ms()
+                if stale_ms is None or stale_ms > BATTERY_STALE_MS:
+                    log("Pre-sleep battery publish (stale)")
+                    self._publish_battery_forced()
+                else:
+                    log(f"Pre-sleep battery publish skipped ({stale_ms // 1000}s since last)")
+            except Exception as e:
+                log(f"Pre-sleep battery publish errored: {e}")
+
         # Configure wake sources BEFORE BLE shutdown
         power_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
         esp32.wake_on_ext0(power_pin, 0)
@@ -418,14 +464,8 @@ class ShieldRemote:
         if time.ticks_diff(now, self._last_press_time) < self._debounce_ms:
             return
 
-        for i, (btn, action, name, is_adc) in enumerate(self.ha_buttons):
-            # Read button state
-            if is_adc:
-                # ADC-based button - pressed when ADC reads near 0
-                raw = btn.read()
-                state = 0 if raw < ADC_BUTTON_THRESHOLD else 1
-            else:
-                state = btn.value()
+        for i, (btn, action, name) in enumerate(self.ha_buttons):
+            state = btn.value()
 
             if state != self.ha_button_states[i]:
                 self._last_press_time = now
@@ -441,9 +481,10 @@ class ShieldRemote:
         log(f"HA button: {name}")
         if ha_client.is_configured:
             ha_client.send_button(action)
-            # Also send battery if due
-            percent, voltage = self._read_battery()
-            ha_client.send_battery(percent, voltage)
+            # Also send battery if due (piggy-back, rate-limited in send_battery)
+            if self._battery_enabled:
+                percent, voltage = self._read_battery()
+                ha_client.send_battery(percent, voltage, self._last_battery_uv)
         else:
             log("HA not configured - hold Shortcut1+3 for setup")
 
@@ -482,24 +523,30 @@ class ShieldRemote:
             self.led.write()
 
     def _read_battery(self):
-        """Read battery voltage and return percentage (0-100)."""
-        raw = self._battery_adc.read()
-        # LOLIN has 100k/100k divider, so multiply by 2
-        voltage = (raw / 4095) * 3.3 * 2
+        """Read battery voltage and return (percent, voltage).
 
-        # LiPo voltage to percentage (approximate)
-        # 4.2V = 100%, 3.2V = 0%
-        if voltage >= 4.2:
-            percent = 100
-        elif voltage <= 3.2:
-            percent = 0
-        else:
-            percent = int((voltage - 3.2) / 1.0 * 100)
+        Uses calibrated ADC (read_uv), median-of-N sampling to reject the
+        VN/VP ADC-glitch erratum, then a LiPo discharge LUT for percent.
+        Divider is 2:1 (470k/470k), so VBAT = 2 * pin voltage.
+        Returns (0, 0.0) if battery monitoring is disabled.
+        """
+        if not self._battery_enabled:
+            return 0, 0.0
+        samples = []
+        for _ in range(16):
+            samples.append(self._battery_adc.read_uv())
+        samples.sort()
+        pin_uv = samples[8]  # median
+        self._last_battery_uv = pin_uv
 
+        voltage = (pin_uv / 1000000.0) * 2.0  # divider ratio
+        percent = _lipo_voltage_to_percent(voltage)
         return percent, voltage
 
     def _update_battery(self):
         """Update battery level if interval has passed."""
+        if not self._battery_enabled:
+            return
         now = time.ticks_ms()
         if time.ticks_diff(now, self._last_battery_update) >= self._battery_update_interval:
             self._last_battery_update = now
@@ -508,6 +555,26 @@ class ShieldRemote:
             if self._connected:
                 self.kb.notify_battery_level()
             log(f"Battery: {percent}% ({voltage:.2f}V)")
+
+    def _publish_battery_forced(self):
+        """Read battery and force-publish to HA, connecting MQTT if needed.
+
+        Used on boot/wake and (conditionally) before deep sleep. Swallows
+        errors so the caller's main flow (e.g. entering deep sleep) is never
+        blocked by a flaky network. No-op if battery monitoring is disabled.
+        """
+        if not self._battery_enabled:
+            return False
+        percent, voltage = self._read_battery()
+        self.kb.set_battery_level(percent)
+        log(f"Battery: {percent}% ({voltage:.2f}V)")
+        if not ha_client.is_configured:
+            return False
+        try:
+            return ha_client.send_battery(percent, voltage, self._last_battery_uv, force=True)
+        except Exception as e:
+            log(f"Battery force-publish failed: {e}")
+            return False
 
     def _log_ble_state(self):
         """Log BLE events from main loop context (IRQ-safe bitmask)."""
@@ -622,16 +689,7 @@ class ShieldRemote:
         # Check if any BLE button is currently pressed
         any_ble_pressed = any(btn.value() == 0 for btn, _, _, _ in self.ble_buttons)
 
-        # Check if any HA button is pressed (including ADC-based)
-        any_ha_pressed = False
-        for btn, _, _, is_adc in self.ha_buttons:
-            if is_adc:
-                if btn.read() < ADC_BUTTON_THRESHOLD:
-                    any_ha_pressed = True
-                    break
-            elif btn.value() == 0:
-                any_ha_pressed = True
-                break
+        any_ha_pressed = any(btn.value() == 0 for btn, _, _ in self.ha_buttons)
 
         # Check power button
         power_pressed = self._power_btn.value() == 0
@@ -662,15 +720,8 @@ class ShieldRemote:
                         self.set_led(COLOR_OFF)
 
                 # Test HA buttons
-                for i, (btn, action, name, is_adc) in enumerate(self.ha_buttons):
-                    if is_adc:
-                        if btn.read() < ADC_BUTTON_THRESHOLD:
-                            print(f"HA: {name} ({action}, ADC)")
-                            self.set_led(COLOR_PURPLE)
-                            while btn.read() < ADC_BUTTON_THRESHOLD:
-                                time.sleep_ms(10)
-                            self.set_led(COLOR_OFF)
-                    elif btn.value() == 0:
+                for i, (btn, action, name) in enumerate(self.ha_buttons):
+                    if btn.value() == 0:
                         print(f"HA: {name} ({action})")
                         self.set_led(COLOR_PURPLE)
                         while btn.value() == 0:
@@ -716,10 +767,10 @@ class ShieldRemote:
         self.set_led(COLOR_BLUE)
         log("Ready - BLE advertising as 'Something Remote' (30ms fast)")
 
-        # Initial battery reading
-        percent, voltage = self._read_battery()
-        self.kb.set_battery_level(percent)
-        log(f"Battery: {percent}% ({voltage:.2f}V)")
+        # Initial battery reading + force-publish to HA (covers cold boot AND wake
+        # from deep sleep, which go through the same boot path). Gives us a
+        # post-wake data point to bracket against the pre-sleep publish.
+        self._publish_battery_forced()
 
         # Main loop
         log("Entering main loop")
@@ -762,6 +813,8 @@ def main():
             led = NeoPixel(Pin(LED_PIN, Pin.OUT), 1)
         except Exception:
             pass
+    # Load config before ShieldRemote() so __init__ sees user settings (e.g. battery_enabled)
+    config.load()
     try:
         remote = ShieldRemote()
         remote.run()

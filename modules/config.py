@@ -30,6 +30,7 @@ class Config:
         "device_name": "something_remote",
         "configured": False,
         "power_button_mode": POWER_MODE_HA,  # POWER_MODE_HA or POWER_MODE_BLE
+        "battery_enabled": False,  # Requires hardware mod: 470k/470k + 1uF to GPIO39
     }
 
     def __init__(self):
@@ -169,6 +170,14 @@ class Config:
     @power_button_mode.setter
     def power_button_mode(self, value):
         self._config["power_button_mode"] = value
+
+    @property
+    def battery_enabled(self):
+        return bool(self._config.get("battery_enabled", False))
+
+    @battery_enabled.setter
+    def battery_enabled(self, value):
+        self._config["battery_enabled"] = bool(value)
 
 
 # Global config instance
