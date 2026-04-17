@@ -7,6 +7,7 @@ import machine
 import esp32
 import time
 import sys
+import asyncio
 from neopixel import NeoPixel
 from hid_services import Keyboard
 from config import config, POWER_MODE_BLE, POWER_MODE_HA
@@ -285,14 +286,14 @@ class ShieldRemote:
 
     # --- Power management ---
 
-    def _enter_deep_sleep(self):
+    async def _enter_deep_sleep(self):
         """Enter deep sleep. Does not return."""
         log("DEEP SLEEP - entering")
         self.set_led(COLOR_OFF)
 
-        # Publish a final battery reading if our last one is stale, so we can
-        # measure sleep-drain against the post-wake reading. Skip silently if
-        # already fresh. Wrapped so network flakiness can never block sleep.
+        # Publish a final battery reading if stale, then drain the outbox so
+        # we don't lose it to the shutdown. Wrapped: network flake never
+        # blocks sleep past the drain timeout.
         if self._battery_enabled and ha_client.is_configured:
             try:
                 stale_ms = ha_client.time_since_last_battery_ms()
@@ -303,6 +304,13 @@ class ShieldRemote:
                     log(f"Pre-sleep battery publish skipped ({stale_ms // 1000}s since last)")
             except Exception as e:
                 log(f"Pre-sleep battery publish errored: {e}")
+
+        # Give mqtt_as up to 3s to flush any queued publishes before teardown
+        try:
+            await ha_client.drain(3000)
+            await ha_client.stop()
+        except Exception as e:
+            log(f"HA stop errored: {e}")
 
         # Configure wake sources BEFORE BLE shutdown
         power_pin = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
@@ -328,8 +336,8 @@ class ShieldRemote:
             self._connected = False
         deepsleep()
 
-    def _check_idle_timeout(self):
-        """30s no activity → deep sleep."""
+    async def _check_idle_timeout(self):
+        """Deep-sleep when idle timer expires (async because sleep entry is async)."""
         idle_time = time.ticks_diff(time.ticks_ms(), self._last_activity)
         if idle_time >= IDLE_TIMEOUT_MS:
             # Don't sleep if no bonds and within pairing window
@@ -337,7 +345,7 @@ class ShieldRemote:
                 since_boot = time.ticks_diff(time.ticks_ms(), self._boot_time)
                 if since_boot < SLEEP_INHIBIT_MS:
                     return
-            self._enter_deep_sleep()
+            await self._enter_deep_sleep()
 
     def _reset_activity(self, from_button=False):
         """Reset the idle timer on activity."""
@@ -732,8 +740,9 @@ class ShieldRemote:
         except KeyboardInterrupt:
             print("\nTest ended")
 
-    def run(self):
-        """Main loop - start BLE and handle button input."""
+    async def run(self):
+        """Main loop — async. Button handlers stay synchronous; they enqueue
+        to ha_client which is drained by an independent mqtt_as-backed task."""
         log("Starting Something Remote")
         log(f"BLE buttons: {len(BLE_BUTTONS)}, HA buttons: {len(HA_BUTTONS)}")
         log(f"Power: {IDLE_TIMEOUT_MS // 1000}s idle → deep sleep")
@@ -743,8 +752,6 @@ class ShieldRemote:
         wake_reason = machine.wake_reason() if hasattr(machine, 'wake_reason') else 0
         log(f"Wake reason: {wake_reason}")
 
-        # Load config
-        config.load()
         if config.is_configured:
             log(f"HA configured: {config.mqtt_host}")
             power_mode = "BLE" if config.power_button_mode == POWER_MODE_BLE else "Home Assistant"
@@ -757,7 +764,7 @@ class ShieldRemote:
         # Start BLE services
         log("Starting BLE services")
         self.kb.start()
-        time.sleep_ms(100)
+        await asyncio.sleep_ms(100)
 
         # Mark BLE as ready and start fast advertising for reconnection
         self._ble_ready = True
@@ -767,9 +774,12 @@ class ShieldRemote:
         self.set_led(COLOR_BLUE)
         log("Ready - BLE advertising as 'Something Remote' (30ms fast)")
 
-        # Initial battery reading + force-publish to HA (covers cold boot AND wake
-        # from deep sleep, which go through the same boot path). Gives us a
-        # post-wake data point to bracket against the pre-sleep publish.
+        # Kick off mqtt_as (WiFi + MQTT + discovery + auto-reconnect) in the
+        # background. This does not block button handling.
+        if ha_client.is_configured:
+            await ha_client.start()
+
+        # Enqueue boot/wake battery publish — delivered whenever the outbox drains.
         self._publish_battery_forced()
 
         # Main loop
@@ -790,10 +800,9 @@ class ShieldRemote:
                 if mpu6050.is_initialized and mpu6050.check_motion():
                     self._reset_activity()
 
-                self._check_idle_timeout()
-                ha_client.check_idle_timeout()
+                await self._check_idle_timeout()
 
-                time.sleep_ms(LOOP_SLEEP_MS)
+                await asyncio.sleep_ms(LOOP_SLEEP_MS)
                 error_count = 0
 
             except Exception as e:
@@ -802,7 +811,20 @@ class ShieldRemote:
                 if error_count >= 5:
                     log("Too many errors, restarting...")
                     raise
-                time.sleep_ms(100)
+                await asyncio.sleep_ms(100)
+
+
+async def _async_main():
+    remote = ShieldRemote()
+    try:
+        await remote.run()
+    finally:
+        # If run() exits for any reason (clean or error), make sure mqtt_as
+        # and its tasks aren't left running before we reset.
+        try:
+            await ha_client.stop()
+        except Exception:
+            pass
 
 
 def main():
@@ -816,8 +838,7 @@ def main():
     # Load config before ShieldRemote() so __init__ sees user settings (e.g. battery_enabled)
     config.load()
     try:
-        remote = ShieldRemote()
-        remote.run()
+        asyncio.run(_async_main())
     except MemoryError as e:
         log(f"FATAL: MemoryError - {e}")
         sys.print_exception(e)

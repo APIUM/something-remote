@@ -35,9 +35,13 @@ docker-build:
 
 .PHONY: version-file
 version-file:
+# Only regenerate on the host side. Inside Docker the .git dir isn't mounted,
+# so git describe fails and we'd overwrite the host-generated version with "dev".
+ifeq ($(RUN_IN_DOCKER), 1)
 	@VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo dev) ; \
 	  echo "Writing modules/_version.py ($$VERSION)" ; \
 	  printf 'VERSION = "%s"\n' "$$VERSION" > modules/_version.py
+endif
 
 .PHONY: build
 build: version-file
