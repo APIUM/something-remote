@@ -305,11 +305,13 @@ class ShieldRemote:
             except Exception as e:
                 log(f"Pre-sleep battery publish errored: {e}")
 
-        # Give mqtt_as up to 3s to flush any queued publishes before teardown
+        # Give mqtt_as up to 3s to flush any queued publishes before teardown.
+        # BaseException (not Exception) because MicroPython's CancelledError
+        # is a BaseException and can bubble up from the awaited shutdown.
         try:
             await ha_client.drain(3000)
             await ha_client.stop()
-        except Exception as e:
+        except BaseException as e:
             log(f"HA stop errored: {e}")
 
         # Configure wake sources BEFORE BLE shutdown
@@ -820,10 +822,11 @@ async def _async_main():
         await remote.run()
     finally:
         # If run() exits for any reason (clean or error), make sure mqtt_as
-        # and its tasks aren't left running before we reset.
+        # and its tasks aren't left running before we reset. BaseException
+        # is needed because CancelledError is a BaseException in MicroPython.
         try:
             await ha_client.stop()
-        except Exception:
+        except BaseException:
             pass
 
 

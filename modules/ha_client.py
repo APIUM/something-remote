@@ -97,7 +97,12 @@ class HomeAssistantClient:
         return True
 
     async def stop(self):
-        """Graceful shutdown, safe to call on a client that never started."""
+        """Graceful shutdown, safe to call on a client that never started.
+
+        Note: MicroPython's asyncio.CancelledError inherits from BaseException,
+        not Exception — we need a bare except (or BaseException) so the
+        awaited-cancellation doesn't propagate out of the deep-sleep path.
+        """
         if not self._started:
             return
         for task in (self._worker_task, self._watcher_task):
@@ -106,16 +111,16 @@ class HomeAssistantClient:
             task.cancel()
             try:
                 await task
-            except Exception:
+            except BaseException:
                 pass
         if self._client is not None:
             try:
                 await self._client.disconnect()
-            except Exception:
+            except BaseException:
                 pass
             try:
                 self._client.close()
-            except Exception:
+            except BaseException:
                 pass
         self._worker_task = None
         self._watcher_task = None
