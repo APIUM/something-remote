@@ -33,8 +33,14 @@ docker-build:
 	@echo "Building Docker image..."
 	docker build -t $(IMAGE) .
 
+.PHONY: version-file
+version-file:
+	@VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo dev) ; \
+	  echo "Writing modules/_version.py ($$VERSION)" ; \
+	  printf 'VERSION = "%s"\n' "$$VERSION" > modules/_version.py
+
 .PHONY: build
-build:
+build: version-file
 ifeq ($(RUN_IN_DOCKER), 1)
 	@echo "Building in Docker container..."
 	$(DOCKER) make build BOARD=$(BOARD)

@@ -1,6 +1,9 @@
 # Build output
 build/
 
+# Generated from git describe at build time
+modules/_version.py
+
 # Python cache
 __pycache__/
 *.pyc

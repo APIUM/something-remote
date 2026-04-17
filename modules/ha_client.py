@@ -9,6 +9,11 @@ import machine
 from config import config
 
 try:
+    from _version import VERSION
+except ImportError:
+    VERSION = "dev"
+
+try:
     from umqtt.simple import MQTTClient
     HAS_MQTT = True
 except ImportError:
@@ -149,7 +154,7 @@ class HomeAssistantClient:
             "name": self.device_name,
             "manufacturer": "DIY",
             "model": "Everything Remote",
-            "sw_version": "1.0"
+            "sw_version": VERSION,
         }
 
         # Button triggers
