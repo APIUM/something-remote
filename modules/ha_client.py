@@ -183,14 +183,19 @@ class HomeAssistantClient:
         return True
 
     def send_button(self, button_id):
-        """Enqueue a button action publish."""
+        """Enqueue a button press — publishes both the device-trigger action
+        and the event entity payload so HA gets a log in its Logbook."""
         if not self.is_configured:
             log("HA not configured")
             return False
-        ok = self.enqueue(f"{self._device_id}/action", button_id)
-        if ok:
+        ok_action = self.enqueue(f"{self._device_id}/action", button_id)
+        ok_event = self.enqueue(
+            f"{self._device_id}/event",
+            json.dumps({"event_type": button_id}),
+        )
+        if ok_action and ok_event:
             log(f"Enqueued button: {button_id}")
-        return ok
+        return ok_action and ok_event
 
     def send_battery(self, percent, voltage, raw_uv=0, force=False):
         """Enqueue a battery state publish.
@@ -254,6 +259,21 @@ class HomeAssistantClient:
                 "device": device_info,
             })
             await self._client.publish(topic, payload, retain=True)
+
+        # Event entity: lets HA log every press in Logbook/History with
+        # timestamp (device triggers don't show up there). Coexists with the
+        # device-trigger discovery above — existing automations still fire.
+        event_cfg = {
+            "name": "Button",
+            "state_topic": f"{self._device_id}/event",
+            "event_types": [btn_id for btn_id, _ in buttons],
+            "unique_id": f"{self._device_id}_button",
+            "device": device_info,
+        }
+        await self._client.publish(
+            f"homeassistant/event/{self._device_id}/button/config",
+            json.dumps(event_cfg), retain=True,
+        )
 
         # Battery sensors — only advertised if the hardware mod is installed.
         # Blank the retained configs when disabled so HA drops stale entities.
