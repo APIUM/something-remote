@@ -130,7 +130,7 @@ class MPU6050Wake:
         # PWR_MGMT_2: LP_WAKE_CTRL = 01 (5Hz sample rate), disable gyro
         self._write_byte(REG_PWR_MGMT_2, 0x47)
 
-        print("MPU6050 motion detection configured (threshold=20, HPF=5Hz, cycle mode)")
+        print("MPU6050 motion detection configured (threshold=50, HPF=5Hz, cycle mode)")
 
     def get_int_pin(self):
         """Get the interrupt pin object for wake configuration."""

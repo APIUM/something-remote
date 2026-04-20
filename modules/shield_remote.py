@@ -222,7 +222,11 @@ class ShieldRemote:
     """BLE HID remote control for Nvidia Shield + Home Assistant."""
 
     def __init__(self, name="Something Remote"):
-        # Initialize LED if enabled (Everything Remote has no onboard LED)
+        # Fast path: keep __init__ to Python state only so run() can kb.start()
+        # and begin advertising within ~100 ms of wake. All hardware init
+        # (MPU6050, button pins, wake pins, battery ADC) is deferred to
+        # _late_init() which runs after BLE is already advertising.
+
         self.led = None
         if HAS_LED:
             try:
@@ -231,57 +235,34 @@ class ShieldRemote:
             except Exception:
                 print("LED init failed on GPIO", LED_PIN)
 
-        # Initialize accelerometer BEFORE button setup
-        # MPU6050 uses GPIO22 (SCL) and GPIO33 (SDA) for I2C, then releases them.
-        # Button init on those pins must happen after I2C is done.
-        log("Initializing MPU6050 accelerometer...")
-        if mpu6050.init():
-            log("MPU6050 ready - motion wake enabled")
-        else:
-            log("MPU6050 not found - motion wake disabled")
-
-        # Track if BLE is fully initialized
         self._ble_ready = False
 
-        # Initialize keyboard HID
+        # Keyboard() just instantiates the Python object; kb.start() later
+        # actually brings up the BLE stack.
         self.kb = Keyboard(name)
         self.kb.set_state_change_callback(self._on_state_change)
 
-        # Initialize BLE buttons
+        # Button collections get populated in _late_init(), but exist empty
+        # here so any IRQ that fires before _late_init doesn't crash.
         self.ble_buttons = []
         self.ble_button_states = []
-        for pin_num, code, name, has_pullup, btn_type in BLE_BUTTONS:
-            if has_pullup:
-                btn = Pin(pin_num, Pin.IN, Pin.PULL_UP)
-            else:
-                btn = Pin(pin_num, Pin.IN)
-            self.ble_buttons.append((btn, code, name, btn_type))
-            self.ble_button_states.append(1)  # Initial state (not pressed)
-
-        # Initialize HA buttons
         self.ha_buttons = []
         self.ha_button_states = []
-        for pin_num, action, name, has_pullup in HA_BUTTONS:
-            if has_pullup:
-                btn = Pin(pin_num, Pin.IN, Pin.PULL_UP)
-            else:
-                btn = Pin(pin_num, Pin.IN)
-            self.ha_buttons.append((btn, action, name))
-            self.ha_button_states.append(1)  # Initial state (not pressed)
+        self._power_btn = None
+        self._power_btn_state = 1
 
-        # Power button - handled separately based on config.power_button_mode
-        self._power_btn = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
-        self._power_btn_state = 1  # Initial state (not pressed)
-
-        # State tracking
+        # State tracking — must all be set before kb.start() because the BLE
+        # IRQ callbacks (_on_state_change) read them.
         self._connected = False
         self._last_press_time = 0
         self._debounce_ms = 50
         self._any_pressed = False
-        self._active_type = None  # Track which report type is active
-        self._failed_connects = 0  # Track connect-without-encryption failures
+        self._active_type = None
+        self._failed_connects = 0
 
-        # Wake counter (diagnostic, opt-in). Load from RTC RAM and bump.
+        # Wake counter (diagnostic, opt-in). Load from RTC RAM and bump now so
+        # the count reflects this boot; stays in RAM across deep sleep, clears
+        # on hard reset.
         self._wake_counter_enabled = config.wake_counter_enabled
         self._wake_count = 0
         if self._wake_counter_enabled:
@@ -289,15 +270,47 @@ class ShieldRemote:
             _store_wake_count(self._wake_count)
             log(f"Wake counter: {self._wake_count}")
 
-        # Battery monitoring — opt-in via config.battery_enabled because it
-        # requires a hardware mod (470k/470k divider from VBAT to GPIO39/VN
-        # plus a 1uF cap to GND). Without the mod the ADC pin is floating and
-        # reporting numbers would just be noise, so we skip the whole path.
+        # Battery monitoring state — ADC itself is initialised in _late_init.
         self._battery_enabled = config.battery_enabled
         self._battery_adc = None
         self._last_battery_update = 0
-        self._battery_update_interval = 60000  # Update every 60 seconds
-        self._last_battery_uv = 0  # Last raw ADC reading in microvolts (for debug)
+        self._battery_update_interval = 60000
+        self._last_battery_uv = 0
+
+        self._last_activity = time.ticks_ms()
+        self._boot_time = time.ticks_ms()
+
+        self._forget_combo_start = 0
+        self._forget_combo_duration = 5000
+        self._setup_combo_start = 0
+        self._setup_combo_duration = 5000
+
+    def _late_init(self):
+        """Hardware init deferred until after BLE advertising is up.
+
+        Order matters: MPU6050 uses I2C on GPIO22 (SCL) and GPIO33 (SDA)
+        which are also the Select and Shortcut4 button pins. The MPU
+        driver re-configures those pins back to input/pull-up after its
+        init, so button pin setup must come after MPU init.
+        """
+        log("Initializing MPU6050 accelerometer...")
+        if mpu6050.init():
+            log("MPU6050 ready - motion wake enabled")
+        else:
+            log("MPU6050 not found - motion wake disabled")
+
+        for pin_num, code, name, has_pullup, btn_type in BLE_BUTTONS:
+            btn = Pin(pin_num, Pin.IN, Pin.PULL_UP) if has_pullup else Pin(pin_num, Pin.IN)
+            self.ble_buttons.append((btn, code, name, btn_type))
+            self.ble_button_states.append(1)
+
+        for pin_num, action, name, has_pullup in HA_BUTTONS:
+            btn = Pin(pin_num, Pin.IN, Pin.PULL_UP) if has_pullup else Pin(pin_num, Pin.IN)
+            self.ha_buttons.append((btn, action, name))
+            self.ha_button_states.append(1)
+
+        self._power_btn = Pin(PIN_POWER, Pin.IN, Pin.PULL_UP)
+
         if self._battery_enabled:
             self._battery_adc = ADC(Pin(PIN_BATTERY))
             self._battery_adc.atten(ADC.ATTN_11DB)
@@ -305,19 +318,7 @@ class ShieldRemote:
         else:
             log("Battery monitoring: disabled (enable in setup portal if board has mod)")
 
-        # Power management
-        self._last_activity = time.ticks_ms()
-        self._boot_time = time.ticks_ms()
-
         self._setup_wake_pins()
-
-        # BLE forget combo (Power + Back held for 5 seconds)
-        self._forget_combo_start = 0
-        self._forget_combo_duration = 5000  # 5 seconds
-
-        # Setup portal combo (Shortcut1 + Shortcut3 held for 5 seconds)
-        self._setup_combo_start = 0
-        self._setup_combo_duration = 5000  # 5 seconds
 
     def _setup_wake_pins(self):
         """Configure GPIO pins with pull-ups for button input."""
@@ -542,6 +543,8 @@ class ShieldRemote:
 
     def _handle_power_button(self):
         """Handle power button based on config.power_button_mode."""
+        if self._power_btn is None:
+            return
         now = time.ticks_ms()
 
         # Debounce check
@@ -808,18 +811,21 @@ class ShieldRemote:
             self._enter_setup_portal()
             return  # Won't reach here, portal resets
 
-        # Start BLE services
+        # Fast path: start BLE and begin advertising ASAP so the Shield sees
+        # us on its first post-wake scan window. Everything else (MPU init,
+        # button pin setup, battery ADC, wake pins, MQTT) can happen after.
         log("Starting BLE services")
         self.kb.start()
-        await asyncio.sleep_ms(100)
-
-        # Mark BLE as ready and start fast advertising for reconnection
         self._ble_ready = True
         self.kb.start_fast_advertising()
-
-        machine.freq(CPU_FREQ_IDLE)
         self.set_led(COLOR_BLUE)
         log("Ready - BLE advertising as 'Something Remote' (30ms fast)")
+
+        # Deferred hardware init (MPU, buttons, battery ADC, wake pins)
+        self._late_init()
+
+        # CPU back to idle clock now that the init work is done
+        machine.freq(CPU_FREQ_IDLE)
 
         # Kick off mqtt_as (WiFi + MQTT + discovery + auto-reconnect) in the
         # background. This does not block button handling.
