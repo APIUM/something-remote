@@ -65,13 +65,46 @@ WAKE_PINS = [
 ]
 
 # Power management settings
-# 30s no motion/buttons → deep sleep. Wake on button/motion → boot → reconnect.
-IDLE_TIMEOUT_MS = 5 * 60 * 1000          # 5 min no activity → deep sleep
+# Each wake from motion or button keeps the device at ~50mA for IDLE_TIMEOUT_MS
+# before deep-sleeping again. 60s is a good balance — most sessions are longer
+# than that anyway (Shield stays connected and resets the timer), but random
+# motion-triggered wakes don't cost 5 minutes of awake current.
+IDLE_TIMEOUT_MS = 60 * 1000              # 1 min no activity → deep sleep
 SLEEP_INHIBIT_MS = 300 * 1000            # 5 min no-sleep for initial pairing
 LOOP_SLEEP_MS = 50                       # 50ms polling
 CPU_FREQ_ACTIVE = 160000000              # 160MHz when connected
 CPU_FREQ_IDLE = 80000000                 # 80MHz when idle
 BATTERY_STALE_MS = 30 * 60 * 1000        # 30 min — republish before sleep if older
+
+
+# --- Wake counter (diagnostic, opt-in via config) ---------------------------
+# Persists across deep sleep via RTC RAM; reset on cold boot / hard reset.
+# Lets us count all wake cycles (including ones that never successfully
+# publish to MQTT), which is otherwise invisible.
+
+_WAKE_COUNT_MAGIC = 0xBEEF1234  # sentinel so we don't mistake garbage for a count
+
+
+def _load_wake_count():
+    """Return counter from RTC RAM, or 0 on cold boot / invalid data."""
+    try:
+        mem = machine.RTC().memory()
+        if len(mem) >= 8:
+            magic = int.from_bytes(mem[0:4], "little")
+            if magic == _WAKE_COUNT_MAGIC:
+                return int.from_bytes(mem[4:8], "little")
+    except Exception:
+        pass
+    return 0
+
+
+def _store_wake_count(n):
+    try:
+        machine.RTC().memory(
+            _WAKE_COUNT_MAGIC.to_bytes(4, "little") + n.to_bytes(4, "little")
+        )
+    except Exception:
+        pass
 
 # LiPo discharge curve at low load (~0.2C), resting voltage.
 # Sorted descending by voltage. Linear interp between points.
@@ -247,6 +280,14 @@ class ShieldRemote:
         self._any_pressed = False
         self._active_type = None  # Track which report type is active
         self._failed_connects = 0  # Track connect-without-encryption failures
+
+        # Wake counter (diagnostic, opt-in). Load from RTC RAM and bump.
+        self._wake_counter_enabled = config.wake_counter_enabled
+        self._wake_count = 0
+        if self._wake_counter_enabled:
+            self._wake_count = _load_wake_count() + 1
+            _store_wake_count(self._wake_count)
+            log(f"Wake counter: {self._wake_count}")
 
         # Battery monitoring — opt-in via config.battery_enabled because it
         # requires a hardware mod (470k/470k divider from VBAT to GPIO39/VN
@@ -494,7 +535,8 @@ class ShieldRemote:
             # Also send battery if due (piggy-back, rate-limited in send_battery)
             if self._battery_enabled:
                 percent, voltage = self._read_battery()
-                ha_client.send_battery(percent, voltage, self._last_battery_uv)
+                wc = self._wake_count if self._wake_counter_enabled else None
+                ha_client.send_battery(percent, voltage, self._last_battery_uv, wake_count=wc)
         else:
             log("HA not configured - hold Shortcut1+3 for setup")
 
@@ -580,8 +622,11 @@ class ShieldRemote:
         log(f"Battery: {percent}% ({voltage:.2f}V)")
         if not ha_client.is_configured:
             return False
+        wc = self._wake_count if self._wake_counter_enabled else None
         try:
-            return ha_client.send_battery(percent, voltage, self._last_battery_uv, force=True)
+            return ha_client.send_battery(
+                percent, voltage, self._last_battery_uv, force=True, wake_count=wc,
+            )
         except Exception as e:
             log(f"Battery force-publish failed: {e}")
             return False

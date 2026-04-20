@@ -94,6 +94,17 @@ class HomeAssistantClient:
         except Exception as e:
             log(f"MQTT initial connect error: {e}")
 
+        # Disable WiFi modem sleep. With the default power-save, ESP32 sleeps
+        # the WiFi radio between AP beacons, occasionally dropping PINGRESP
+        # packets so mqtt_as decides the connection is dead and forces a
+        # reconnect every ~50s. Observed in broker log as a flap storm with
+        # "session taken over" reasons. PM_NONE trades ~10-20mA of extra
+        # current (only while we're awake) for a stable TCP connection.
+        try:
+            sta = network.WLAN(network.STA_IF)
+            sta.config(pm=sta.PM_NONE)
+        except Exception as e:
+            log(f"WiFi PM_NONE failed: {e}")
         return True
 
     async def stop(self):
@@ -220,11 +231,12 @@ class HomeAssistantClient:
             log(f"Enqueued button: {button_id}")
         return ok_action and ok_event
 
-    def send_battery(self, percent, voltage, raw_uv=0, force=False):
+    def send_battery(self, percent, voltage, raw_uv=0, force=False, wake_count=None):
         """Enqueue a battery state publish.
 
         force=True bypasses the 10-min rate limit; used for boot/wake/pre-sleep.
         force=False piggy-backs on button presses and skips if within the window.
+        wake_count, if not None, is included as a diagnostic field.
         """
         if not self.is_configured or not config.battery_enabled:
             return False
@@ -232,15 +244,18 @@ class HomeAssistantClient:
         if not force and self._last_battery_report != 0:
             if time.ticks_diff(now, self._last_battery_report) < self.BATTERY_REPORT_INTERVAL_MS:
                 return True
-        payload = json.dumps({
+        body = {
             "percent": percent,
             "voltage": round(voltage, 3),
             "raw_uv": raw_uv,
-        })
-        ok = self.enqueue(f"{self._device_id}/battery", payload)
+        }
+        if wake_count is not None:
+            body["wake_count"] = wake_count
+        ok = self.enqueue(f"{self._device_id}/battery", json.dumps(body))
         if ok:
             self._last_battery_report = now
-            log(f"Enqueued battery: {percent}% ({voltage:.3f}V, raw {raw_uv}uV){' [forced]' if force else ''}")
+            suffix = f", wake#{wake_count}" if wake_count is not None else ""
+            log(f"Enqueued battery: {percent}% ({voltage:.3f}V, raw {raw_uv}uV{suffix}){' [forced]' if force else ''}")
         return ok
 
     def time_since_last_battery_ms(self):
@@ -306,7 +321,7 @@ class HomeAssistantClient:
         # Battery sensors — only advertised if the hardware mod is installed.
         # Blank the retained configs when disabled so HA drops stale entities.
         if not config.battery_enabled:
-            for subtopic in ("battery", "voltage", "battery_raw_uv"):
+            for subtopic in ("battery", "voltage", "battery_raw_uv", "wake_count"):
                 await self._client.publish(
                     f"homeassistant/sensor/{self._device_id}/{subtopic}/config",
                     "", retain=True,
@@ -356,6 +371,26 @@ class HomeAssistantClient:
             },
             retain=True,
         )
+
+        # Wake counter (diagnostic). Blank the retained config when disabled
+        # so HA drops the entity cleanly.
+        wake_topic = f"homeassistant/sensor/{self._device_id}/wake_count/config"
+        if config.wake_counter_enabled:
+            await self._publish_json(
+                wake_topic,
+                {
+                    "name": "Wake Count",
+                    "state_topic": f"{self._device_id}/battery",
+                    "value_template": "{{ value_json.wake_count | default('') }}",
+                    "unique_id": f"{self._device_id}_wake_count",
+                    "device": device_info,
+                    "entity_category": "diagnostic",
+                    "state_class": "measurement",
+                },
+                retain=True,
+            )
+        else:
+            await self._client.publish(wake_topic, b"", retain=True)
 
         log("Discovery complete")
 

@@ -98,9 +98,11 @@ class MPU6050Wake:
         self._write_byte(REG_ACCEL_CONFIG, 0x01)
 
         # Set motion detection threshold (1-255, lower = more sensitive)
-        # Each LSB = 2mg at ±2g scale
-        # 20 = ~40mg threshold - sensitive enough for pickup, ignores small vibrations
-        self._write_byte(REG_MOT_THR, 20)
+        # Each LSB = 2mg at ±2g scale.
+        # 50 (~100mg) — 20 (40mg) was catching ambient vibration (TV,
+        # walking past) and waking every ~15 min, burning battery via the
+        # idle timer. 100mg still reliably triggers on pick-up.
+        self._write_byte(REG_MOT_THR, 50)
 
         # Set motion detection duration (1-255 ms)
         self._write_byte(REG_MOT_DUR, 1)
